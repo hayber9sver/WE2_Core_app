@@ -154,8 +154,9 @@ CUSTOMER ?= seeed
 # tflm_yolov8_gender_cls
 # tflm_mb_cls
 # torch_mb_cls
+# sscma_cam_mic
 ##
-APP_TYPE = allon_sensor_tflm
+APP_TYPE = sscma_cam_mic
  
 ### Options above must be added before include options.mk ###
 override EPII_ROOT := $(strip $(subst \,/,$(EPII_ROOT)))

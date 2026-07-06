@@ -341,3 +341,14 @@ int main(void)
 	return 0;
 }
 #endif
+
+#ifdef SSCMA_CAM_MIC
+#include "sscma_cam_mic.h"
+/** main entry */
+int main(void)
+{
+	board_init();
+	sscma_cam_mic_app();
+	return 0;
+}
+#endif
