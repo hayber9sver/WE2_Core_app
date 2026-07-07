@@ -177,6 +177,14 @@ void event_reply_named(const char* name, const std::string& data);
  * built as one big heap string first - see send_result.cpp for why. */
 void event_reply_named_with_payload(const char* name, const std::string& prefix_fields,
                                      const char* field_name, const uint8_t* raw, size_t raw_len);
+/* Dedicated binary (no JSON, no base64) framing for the ASAMPLE audio path -
+ * see send_result.cpp for the wire format and why this exists (base64+JSON's
+ * ~33%+ size tax ate the entire inter-chunk time budget at 32kHz on the
+ * 921600-baud UART, so the PDM ring wrapped under the reader). Magic's first
+ * byte is 0xFF, not ASCII, so it can't collide with a coincidental "ASMB"
+ * inside a concurrent base64-encoded image payload - see send_result.cpp. */
+void send_audio_binary_frame(const int16_t* pcm, size_t len_bytes, uint32_t sample_rate,
+                              uint8_t channels, uint8_t bits);
 void send_device_id();
 /* Defined inline (not just declared) because it's a template: any
  * translation unit that instantiates it for a new T (e.g. el_class_t from

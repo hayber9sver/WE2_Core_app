@@ -234,13 +234,12 @@ void at_cmd_poll(void)
         uint32_t len = 0;
         const int16_t* chunk = pdm_audio_poll_chunk(&len);
         if (chunk != nullptr) {
-            /* Streamed instead of audio_2_json_str()+concat_strings() - see
-             * event_reply_named_with_payload()'s comment in send_result.cpp;
-             * this buffer no longer needs a big heap allocation either. */
-            event_reply_named_with_payload("ASAMPLE",
-                concat_strings(", \"sample_rate\": ", std::to_string(pdm_audio_get_rate()),
-                               ", \"channels\": 1, \"bits\": 16"),
-                "audio", reinterpret_cast<const uint8_t*>(chunk), len);
+            /* Binary framing (no JSON/base64) - see send_audio_binary_frame()'s
+             * comment in send_result.cpp. Needed at 32kHz: base64+JSON's size
+             * tax left almost no margin against the 921600-baud UART, so the
+             * PDM ring wrapped under the reader (confirmed via
+             * pdm_audio_debug_log()'s growing backlog). */
+            send_audio_binary_frame(chunk, len, pdm_audio_get_rate(), 1, 16);
         }
     }
 }

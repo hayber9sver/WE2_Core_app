@@ -655,6 +655,58 @@ EL_ATTR_WEAK uint16_t el_crc16_maxim(const uint8_t* data, size_t length) {
     return crc ^ 0xffff;
 }
 
+/* Binary framing for ASAMPLE only (image SAMPLE/INVOKE keep the JSON+base64
+ * path via event_reply_named_with_payload() - viewers/tools depend on that
+ * shape and images aren't bandwidth-critical here). base64's 4/3 expansion
+ * plus the JSON text envelope costs ~10.7KB on the wire per 8000-byte PCM
+ * chunk; at 921600 baud (~92160 B/s) that's ~116ms to send a chunk that only
+ * represents 125ms of audio at 32kHz - almost no margin, and the pdm_audio.c
+ * debug log (pdm_audio_debug_log()) confirmed the ring buffer was wrapping
+ * under the reader as a result (backlog grew unbounded past NUM_BUFF). This
+ * frame drops both the base64 tax and the JSON text envelope, cutting wire
+ * size ~25% (~8016 bytes, ~87ms/chunk - back under the 125ms budget).
+ * All multi-byte fields little-endian (native for this Cortex-M55 build).
+ * Layout: magic[4]=0xFF,'S','M','B' | sample_rate_hz u32 | len_bytes u32 |
+ * channels u8 | bits u8 | reserved[2]=0 | payload | crc16_maxim(payload) u16,
+ * same el_crc16_maxim() used elsewhere in this file. The magic's first byte
+ * is 0xFF specifically (not ASCII 'A') because SAMPLE/INVOKE images share
+ * this same UART as base64-encoded JSON, and base64's alphabet
+ * (A-Za-z0-9+/=) can - and on hardware, did - coincidentally spell out
+ * "ASMB" inside an image's payload, fooling a reader into treating JPEG
+ * bytes as an audio frame header and truncating the image mid-stream. No
+ * byte base64 ever emits is >= 0x80, so 0xFF as the first magic byte makes
+ * that collision structurally impossible while a JSON frame (starts '\r{')
+ * and a raw PCM payload (near-zero chance of this exact 4-byte run) stay
+ * effectively disjoint from it too. */
+static inline void put_u32_le(uint8_t* p, uint32_t v) {
+    p[0] = (uint8_t)(v); p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+static inline void put_u16_le(uint8_t* p, uint16_t v) {
+    p[0] = (uint8_t)(v); p[1] = (uint8_t)(v >> 8);
+}
+
+void send_audio_binary_frame(const int16_t* pcm, size_t len_bytes, uint32_t sample_rate,
+                              uint8_t channels, uint8_t bits) {
+    out_transport_lock();
+
+    uint8_t header[16];
+    header[0] = 0xFF; header[1] = 'S'; header[2] = 'M'; header[3] = 'B';
+    put_u32_le(&header[4], sample_rate);
+    put_u32_le(&header[8], (uint32_t)len_bytes);
+    header[12] = channels;
+    header[13] = bits;
+    header[14] = 0;
+    header[15] = 0;
+    send_bytes(reinterpret_cast<const char*>(header), sizeof(header));
+    send_bytes(reinterpret_cast<const char*>(pcm), len_bytes);
+
+    uint8_t crc_bytes[2];
+    put_u16_le(crc_bytes, el_crc16_maxim(reinterpret_cast<const uint8_t*>(pcm), len_bytes));
+    send_bytes(reinterpret_cast<const char*>(crc_bytes), sizeof(crc_bytes));
+
+    out_transport_unlock();
+}
+
 
 std::string model_info_2_json_str(el_model_info_t model_info) {
     return concat_strings("{\"id\": ",
