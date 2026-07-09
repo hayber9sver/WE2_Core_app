@@ -4,6 +4,18 @@ APPL_DEFINES += -DSSCMA_CAM_MIC
 APPL_DEFINES += -DIP_xdma
 APPL_DEFINES += -DEVT_DATAPATH
 
+# os/freertos's FreeRTOSConfig.h defaults configENABLE_FPU to 0 (its #ifndef
+# fallback - nothing in the tree ever sets it), so the CM55 port skipped
+# saving S16-S31 (= MVE Q4-Q7) on context switch. This app runs two
+# preempting tasks and its image-resize hot loops are auto-vectorized MVE
+# (-mcpu=cortex-m55 -O2) whose gather-load offsets live in exactly those
+# callee-saved Q registers: a 5ms audio_task preemption landing mid-resize
+# clobbered them, and the next gather read from a garbage address wedged the
+# bus - CPU frozen, no fault, no prints (hw-confirmed: heartbeat task died
+# with it). Single-task reference apps (tflm_yolov8_od) never context-switch,
+# which is why the identical datapath/resize code never stalled there.
+APPL_DEFINES += -DconfigENABLE_FPU=1
+
 APPL_DEFINES += -DDBG_MORE
 
 EVENTHANDLER_SUPPORT = event_handler
@@ -14,7 +26,7 @@ EVENTHANDLER_SUPPORT_LIST += evt_datapath
 # Add new library here
 # The source code should be loacted in ~\library\{lib_name}\
 ##
-LIB_SEL = pwrmgmt sensordp tflmtag2209_u55tag2205 spi_ptl spi_eeprom hxevent
+LIB_SEL = pwrmgmt sensordp tflmtag2209_u55tag2205 spi_ptl spi_eeprom hxevent img_proc
 
 ##
 # middleware support feature

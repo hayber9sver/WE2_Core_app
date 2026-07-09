@@ -50,6 +50,7 @@
 #include "WE2_core.h"
 #include "hx_drv_scu.h"
 #include "hx_drv_swreg_aon.h"
+#include "spi_eeprom_comm.h"
 #ifdef IP_sensorctrl
 #include "hx_drv_sensorctrl.h"
 #endif
@@ -96,7 +97,7 @@ static uint8_t  g_tscore = 50;
  * value cam_task should switch to. Set by audio_task (via AT+SENSOR),
  * consumed by cam_task. */
 static volatile int g_pending_subs = -1;
-static APP_DP_INP_SUBSAMPLE_E g_cam_subs = APP_DP_RES_YUV640x480_INP_SUBSAMPLE_1X;
+static APP_DP_INP_SUBSAMPLE_E g_cam_subs = APP_DP_RES_RGB640x480_INP_SUBSAMPLE_1X;
 
 void app_set_cam_stream_mode(cam_stream_mode_e mode) { g_cam_mode = mode; }
 cam_stream_mode_e app_get_cam_stream_mode(void) { return g_cam_mode; }
@@ -283,9 +284,28 @@ int sscma_cam_mic_app(void)
     hx_drv_pmu_get_ctrl(PMU_pmu_wakeup_EVT1, &wakeup_event1);
     xprintf("wakeup_event=0x%x,WakeupEvt1=0x%x\n", wakeup_event, wakeup_event1);
 
+    /* Required before reading a flash-loaded (FLASH_XIP_MODEL=1) model:
+     * without this, tflite::GetModel(MODEL_FLASH_ADDR) reads back whatever
+     * happens to be mapped at that CPU address without the QSPI XIP window
+     * actually enabled - NOT real flash content, and NOT responsive to
+     * anything actually burned there (confirmed on hardware: three
+     * different xmodem burns, including a known-good reference model,
+     * all read back byte-for-byte identical garbage at 0x3AB7B000 without
+     * this call). Every other flash-model app in this repo
+     * (tflm_yolov8_od.c, tflm_fd_fm.c) calls this before its own model
+     * init - allon_sensor_tflm, which this app's cv_init() scaffolding was
+     * copied from, never exercises its own FLASH_XIP_MODEL=1 path in
+     * practice, so this call was never carried over. */
+    hx_lib_spi_eeprom_open(USE_DW_SPI_MST_Q);
+    hx_lib_spi_eeprom_enable_XIP(USE_DW_SPI_MST_Q, true, FLASH_QUAD, true);
+
+    /* Not fatal to the rest of the app (matches pdm_audio_setup() below):
+     * a bad/missing flash-loaded model would otherwise take down UART/
+     * audio/camera-JPEG-streaming entirely, when only AI inference itself
+     * (AT+INVOKE) actually depends on it - see run_yolo_detect()'s
+     * int_ptr==nullptr guard. */
     if (cv_init(true, true) < 0) {
-        xprintf("cv init fail\n");
-        return -1;
+        xprintf("cv init fail (model not loaded - inference will be unavailable)\n");
     }
 
     if (pdm_audio_setup() != 0) {

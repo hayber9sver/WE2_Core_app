@@ -47,7 +47,7 @@
 #define JPEG_BUFSIZE  (((623+ (OV5647_HW5x5_CROP_WIDTH/16)*(OV5647_HW5x5_CROP_HEIGHT/16)* 38 + 35) >>2 ) <<2)	//YUV420 x10 Compress = ((623+ (W/16)*(H/16)* 38 + 35) >>2 ) <<2  byte
 __attribute__(( section(".bss.NoInit"))) uint8_t jpegbuf[JPEG_BUFSIZE] __ALIGNED(32);
 
-#define RAW_BUFSIZE  (OV5647_HW5x5_CROP_WIDTH*OV5647_HW5x5_CROP_HEIGHT*3/2)	//YUV420: Y= W*H byte, U = ((W*H)>>2) byte, V = ((W*H)>>2) byte
+#define RAW_BUFSIZE  (OV5647_HW5x5_CROP_WIDTH*OV5647_HW5x5_CROP_HEIGHT*3)	//RGB: 3 bytes/pixel (was YUV420 *3/2 before the RGB-input YOLO model)
 __attribute__(( section(".bss.NoInit"))) uint8_t demosbuf[RAW_BUFSIZE] __ALIGNED(32);
 
 #define JPEG_HEADER_BUFSIZE 100
@@ -58,7 +58,7 @@ static volatile uint32_t g_wdma2_baseaddr = (uint32_t)jpegbuf;
 static volatile uint32_t g_wdma3_baseaddr = (uint32_t)demosbuf;
 static volatile uint32_t g_jpegautofill_addr = (uint32_t)jpegfilesizebuf;
 
-static APP_DP_INP_SUBSAMPLE_E g_subs = APP_DP_RES_YUV640x480_INP_SUBSAMPLE_1X;
+static APP_DP_INP_SUBSAMPLE_E g_subs = APP_DP_RES_RGB640x480_INP_SUBSAMPLE_1X;
 
 #ifdef OV5647_SUPPORT_BINNING
 static volatile INP_SUBSAMPLE_E g_subsample = INP_SUBSAMPLE_DISABLE;

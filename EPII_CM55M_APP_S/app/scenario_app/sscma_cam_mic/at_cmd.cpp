@@ -125,12 +125,17 @@ static void cmd_sensor(const char* args)
      * EVT_INDEX_EDM_WDT2_TIMEOUT with zero frames ever coming out), so
      * cisdp_dp_init() crops the encoded height down to 112 (real captured
      * rows, not padding) to satisfy that. app_get_raw_height() already
-     * reflects this, so img_rescale()'s NPU input scaling still lines up. */
+     * reflects this, so the resize into the model's input tensor still
+     * lines up.
+     *
+     * RGB640x480_* (not YUV640x480_*): the YOLO detect model needs a
+     * 3-channel RGB raw buffer, not the grayscale-Y-plane-only YUV420 the
+     * old person-detect model used - see cisdp_sensor.c's demosbuf sizing. */
     int width, height, subs;
     switch (opt) {
-    case 2: width = 640; height = 480; subs = APP_DP_RES_YUV640x480_INP_SUBSAMPLE_1X; break;
-    case 1: width = 320; height = 240; subs = APP_DP_RES_YUV640x480_INP_SUBSAMPLE_2X; break;
-    case 0: width = 160; height = 112; subs = APP_DP_RES_YUV640x480_INP_SUBSAMPLE_4X; break;
+    case 2: width = 640; height = 480; subs = APP_DP_RES_RGB640x480_INP_SUBSAMPLE_1X; break;
+    case 1: width = 320; height = 240; subs = APP_DP_RES_RGB640x480_INP_SUBSAMPLE_2X; break;
+    case 0: width = 160; height = 112; subs = APP_DP_RES_RGB640x480_INP_SUBSAMPLE_4X; break;
     default:
         reply_simple("SENSOR", EL_EINVAL, "\"opt must be 0 (160x112), 1 (320x240), or 2 (640x480)\"");
         return;
@@ -205,8 +210,21 @@ void at_cmd_poll(void)
 {
     char c;
     bool got_byte = false;
+    uint32_t rx_spins = 0;
     while (read_bytes_nonblock(&c, 1) == EL_OK) {
         got_byte = true;
+        /* Defense-in-depth (kept permanently, like the idle-flush below):
+         * should the DW_UART driver ever wedge into reporting RX-ready
+         * forever, this loop would otherwise spin unbounded - and since
+         * audio_task outranks cam_task, that would starve the camera
+         * silently. Bail out and report instead. Legitimate traffic can't
+         * hit this: 921600 baud delivers at most ~460 bytes per 5ms poll. */
+        if (++rx_spins > 512u) {
+            xprintf("at_cmd: runaway RX loop, last byte=0x%02x\n",
+                    (unsigned char)c);
+            s_line_len = 0;
+            break;
+        }
         if (c == '\r' || c == '\n') {
             if (s_line_len > 0) {
                 s_line[s_line_len] = '\0';
