@@ -15,6 +15,7 @@
 extern "C" {
 #include "hx_drv_swreg_aon.h"
 }
+#include "common_config.h"
 #define CONSOLE_UART_ID 0
 #define EL_ATTR_WEAK __attribute__((weak))
 #define EL_VERSION                 __TIMESTAMP__
@@ -185,7 +186,18 @@ void event_reply_named_with_payload(const char* name, const std::string& prefix_
  * inside a concurrent base64-encoded image payload - see send_result.cpp. */
 void send_audio_binary_frame(const int16_t* pcm, size_t len_bytes, uint32_t sample_rate,
                               uint8_t channels, uint8_t bits);
-void send_device_id();
+/* Each sends exactly one Operation Response for its own query, per the AT
+ * protocol (at-protocol-en_US.md) - replaces the old send_device_id(), which
+ * blasted all four back-to-back regardless of which one was actually asked
+ * for and used the wrong "name" field on every one of them. */
+void send_name_reply();
+void send_ver_reply();
+void send_id_reply();
+void send_info_reply();
+/* Builds the "model" object embedded in AT+INVOKE's Operation Response -
+ * AT+MODEL?/AT+MODELS? themselves are out of scope for this app. */
+el_model_info_t current_model_info();
+std::string model_info_2_json_str(el_model_info_t model_info);
 /* Defined inline (not just declared) because it's a template: any
  * translation unit that instantiates it for a new T (e.g. el_class_t from
  * cvapp.cpp) needs the body visible, not just a prototype. */

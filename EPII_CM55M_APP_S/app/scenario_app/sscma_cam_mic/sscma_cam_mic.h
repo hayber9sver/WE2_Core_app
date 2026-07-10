@@ -1,15 +1,24 @@
 /*
  * sscma_cam_mic.h
  *
- * Camera (OV5647) + DMIC (PDM) scenario app that speaks an SSCMA/
- * himax_vision.py-flavoured AT-command protocol over UART0:
- *   - AT+INVOKE=-1,0,<result_only>  camera + person-detect inference loop
- *   - AT+SAMPLE=-1                  raw camera stream, no inference
- *   - AT+ASAMPLE=-1                 raw DMIC/PDM stream (base64 PCM)
- *   - AT+BREAK                      stop whichever stream is active
- *   - AT+ASR=<rate>/AT+ASR?         set/query the PDM sample rate
- *   - AT+TSCORE=<0..100>            classification score threshold
- *   - AT+SENSOR=..., AT+INFO?, AT+NAME?, AT+VER?, AT+ID?, AT+MODEL?
+ * Camera (OV5647) + DMIC (PDM) scenario app that speaks a subset of Seeed's
+ * AT protocol (see /home/orangepi/SSCMA-Micro/docs/protocol/
+ * at-protocol-en_US.md) over UART0, audited/aligned to that spec 2026-07-10
+ * - WiFi/MQTT/TRIGGER/ACTION/RC/DFTTPT/KV-store/SSL are all out of scope,
+ * this device has no network transport and no persistent KV store:
+ *   - AT+INVOKE=<n,differed,result_only>  camera + YOLO gesture inference loop
+ *   - AT+SAMPLE=<n>                       raw camera stream, no inference
+ *   - AT+ASAMPLE=<n>                      raw DMIC/PDM stream (binary frames, app-specific)
+ *   - AT+BREAK                            stop whichever stream is active
+ *   - AT+ASR=<rate>/AT+ASR?               set/query the PDM sample rate
+ *   - AT+TSCORE=<0..100>/AT+TSCORE?       detection score threshold
+ *   - AT+TIOU=<0..100>/AT+TIOU?           NMS IoU threshold
+ *   - AT+SENSOR=<id,en,opt>/AT+SENSOR?    set/query camera resolution
+ *   - AT+SENSORS?                         list available camera resolutions
+ *   - AT+STAT?                            boot count / ready state
+ *   - AT+ID?/AT+NAME?/AT+VER?/AT+INFO?    device identity
+ *   - AT+RST                              reboot
+ *   - AT+HELP?                            command list
  * See at_cmd.h for the parser and cvapp.h/pdm_audio.h for the two data
  * sources.
  */
@@ -55,6 +64,19 @@ int app_get_result_only(void);
 /* 0..100, gates whether the "person" class is reported at all */
 void app_set_tscore(uint8_t score_0_100);
 uint8_t app_get_tscore(void);
+
+/* 0..100, NMS IoU threshold (AT+TIOU) - see cvapp.cpp's run_nms(). */
+void app_set_tiou(uint8_t iou_0_100);
+uint8_t app_get_tiou(void);
+
+/* Boot count (AT+STAT?) - incremented once at startup via the AON
+ * "appused1" scratch register (see sscma_cam_mic_app()). KNOWN LIMITATION,
+ * hardware-confirmed: does not actually survive AT+RST (NVIC_SystemReset()
+ * clears appused1 too, not just a real power cycle as originally assumed) -
+ * see sscma_cam_mic_app()'s comment. Reads back 1 after every AT+RST rather
+ * than incrementing; left as-is rather than adding flash-backed persistence
+ * (and its per-boot wear cost) per explicit direction. */
+uint32_t app_get_boot_count(void);
 
 /* Requests cam_task switch the camera datapath to a different resolution at
  * runtime (`subs` is an APP_DP_INP_SUBSAMPLE_E value from cisdp_cfg.h - kept

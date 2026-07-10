@@ -255,8 +255,11 @@ struct yolo_box {
  * looked pathological because boxes for the same hand were shifted by
  * different amounts (proportional to each one's own w/2,h/2), not because
  * real overlap was ever that high. Reverted to the reference's 0.45 now that
- * the actual coordinates are correct. */
-#define NMS_IOU_THRESHOLD 0.45f
+ * the actual coordinates are correct.
+ *
+ * 2026-07-10: now runtime-adjustable via AT+TIOU (app_get_tiou(), default 45
+ * - see sscma_cam_mic.c) instead of a compile-time constant, so this and
+ * AT+TSCORE can both be tuned live without reflashing. */
 #define MAX_YOLO_DETECTIONS 10
 
 /* Corner-based (x,y = top-left, matches ma_nms.h's compute_iou()) - NOT
@@ -492,7 +495,7 @@ int run_nms(const yolo_box* boxes, int n, int* keep_out)
             /* box_containment() (see its comment) catches the case plain IoU
              * misses: a much-smaller box sitting almost entirely inside the
              * kept one. */
-            if (box_iou(boxes[i], boxes[j]) > NMS_IOU_THRESHOLD ||
+            if (box_iou(boxes[i], boxes[j]) > (float)app_get_tiou() / 100.0f ||
                 box_containment(boxes[i], boxes[j]) > NMS_CONTAINMENT_THRESHOLD) {
                 removed[j] = true;
             }

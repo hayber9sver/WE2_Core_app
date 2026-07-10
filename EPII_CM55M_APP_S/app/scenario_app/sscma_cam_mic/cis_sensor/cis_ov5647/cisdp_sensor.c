@@ -330,28 +330,57 @@ int cisdp_sensor_init()
 }
 
 
+/* 2026-07-10: centered-crop ROI for each APP_DP_INP_SUBSAMPLE_E value - see
+ * cisdp_cfg.h's enum comment for why this replaced the old top-left-crop
+ * "_2X/_4X" members. HW2x2 (UNITY process mode) reads exactly this ROI out
+ * of the native 640x480 sensor frame; centering it (rather than the old
+ * fixed (0,0) start) is what makes the smaller options a real center crop
+ * instead of a corner crop. */
+static void subs_get_roi(APP_DP_INP_SUBSAMPLE_E subs, uint16_t *width, uint16_t *height,
+                          uint16_t *crop_stx, uint16_t *crop_sty)
+{
+    switch (subs) {
+    case APP_DP_RES_RGB640x480_INP_CROP_480x480:
+    case APP_DP_RES_YUV640x480_INP_CROP_480x480:
+        *width = 480; *height = 480;
+        break;
+    case APP_DP_RES_RGB640x480_INP_CROP_240x240:
+    case APP_DP_RES_YUV640x480_INP_CROP_240x240:
+        *width = 240; *height = 240;
+        break;
+    default: /* _SUBSAMPLE_1X: full FOV, no crop */
+        *width = 640; *height = 480;
+        break;
+    }
+    *crop_stx = (640 - *width) / 2;
+    *crop_sty = (480 - *height) / 2;
+}
+
+static bool subs_is_rgb(APP_DP_INP_SUBSAMPLE_E subs)
+{
+    return subs == APP_DP_RES_RGB640x480_INP_SUBSAMPLE_1X ||
+           subs == APP_DP_RES_RGB640x480_INP_CROP_480x480 ||
+           subs == APP_DP_RES_RGB640x480_INP_CROP_240x240;
+}
+
 int cisdp_dp_init(bool inp_init, SENSORDPLIB_PATH_E dp_type, evthandlerdp_CBEvent_t cb_event, uint32_t jpg_ratio, APP_DP_INP_SUBSAMPLE_E subs)
 {
     HW2x2_CFG_T hw2x2_cfg;
     CDM_CFG_T cdm_cfg;
     HW5x5_CFG_T hw5x5_cfg;
     JPEG_CFG_T jpeg_cfg;
+    uint16_t roi_w, roi_h, roi_stx, roi_sty;
+
+    subs_get_roi(subs, &roi_w, &roi_h, &roi_stx, &roi_sty);
 
     g_subs = subs;
     //HW2x2 Cfg
     hw2x2_cfg.hw2x2_path = DP_HW2X2_PATH;
     hw2x2_cfg.hw_22_process_mode = DP_HW2X2_PROCESS_MODE;
-    hw2x2_cfg.hw_22_crop_stx = DP_HW2X2_CROP_START_X;
-    hw2x2_cfg.hw_22_crop_sty = DP_HW2X2_CROP_START_Y;
-    hw2x2_cfg.hw_22_in_width = (subs==APP_DP_RES_RGB640x480_INP_SUBSAMPLE_1X||subs==APP_DP_RES_YUV640x480_INP_SUBSAMPLE_1X)?
-    		640:(subs==APP_DP_RES_RGB640x480_INP_SUBSAMPLE_2X||subs==APP_DP_RES_YUV640x480_INP_SUBSAMPLE_2X)?
-    		320:(subs==APP_DP_RES_RGB640x480_INP_SUBSAMPLE_4X||subs==APP_DP_RES_YUV640x480_INP_SUBSAMPLE_4X)?
-    		160:640;//DP_HW2X2_CROP_WIDTH;
-
-    hw2x2_cfg.hw_22_in_height = (subs==APP_DP_RES_RGB640x480_INP_SUBSAMPLE_1X||subs==APP_DP_RES_YUV640x480_INP_SUBSAMPLE_1X)?
-    		480:(subs==APP_DP_RES_RGB640x480_INP_SUBSAMPLE_2X||subs==APP_DP_RES_YUV640x480_INP_SUBSAMPLE_2X)?
-    		240:(subs==APP_DP_RES_RGB640x480_INP_SUBSAMPLE_4X||subs==APP_DP_RES_YUV640x480_INP_SUBSAMPLE_4X)?
-			120:480;//DP_HW2X2_CROP_HEIGHT;
+    hw2x2_cfg.hw_22_crop_stx = roi_stx;
+    hw2x2_cfg.hw_22_crop_sty = roi_sty;
+    hw2x2_cfg.hw_22_in_width = roi_w;
+    hw2x2_cfg.hw_22_in_height = roi_h;
     hw2x2_cfg.hw_22_mono_round_mode = DP_HW2X2_ROUND_MODE;
 
     //CDM Cfg
@@ -378,45 +407,22 @@ int cisdp_dp_init(bool inp_init, SENSORDPLIB_PATH_E dp_type, evthandlerdp_CBEven
     //HW5x5 Cfg
     hw5x5_cfg.hw5x5_path = DP_HW5X5_PATH;
     hw5x5_cfg.demos_bndmode = DP_HW5X5_DEMOS_BNDMODE;
-    hw5x5_cfg.demos_color_mode =
-    		(subs==APP_DP_RES_RGB640x480_INP_SUBSAMPLE_1X||subs==APP_DP_RES_RGB640x480_INP_SUBSAMPLE_2X||subs==APP_DP_RES_RGB640x480_INP_SUBSAMPLE_4X)?
-    		DEMOS_COLORMODE_RGB:
-			(subs==APP_DP_RES_YUV640x480_INP_SUBSAMPLE_1X||subs==APP_DP_RES_YUV640x480_INP_SUBSAMPLE_2X||subs==APP_DP_RES_YUV640x480_INP_SUBSAMPLE_4X)?
-    		DEMOS_COLORMODE_YUV420:DEMOS_COLORMODE_YUV420;//DP_HW5X5_DEMOS_COLORMODE;
+    hw5x5_cfg.demos_color_mode = subs_is_rgb(subs) ? DEMOS_COLORMODE_RGB : DEMOS_COLORMODE_YUV420;
     hw5x5_cfg.demos_pattern_mode = DP_HW5X5_DEMOS_PATTERN;
     hw5x5_cfg.demoslpf_roundmode = DP_HW5X5_DEMOSLPF_ROUNDMODE;
+    /* HW5x5 reads HW2x2's already-cropped ROI output, so its own crop start
+     * stays (0,0) - the centered offset above is only applied once. (Also
+     * fixes a pre-existing copy/paste bug where hw55_crop_sty was seeded
+     * from DP_HW5X5_CROP_START_X - harmless before since both were 0.) */
     hw5x5_cfg.hw55_crop_stx = DP_HW5X5_CROP_START_X;
-    hw5x5_cfg.hw55_crop_sty = DP_HW5X5_CROP_START_X;
-    hw5x5_cfg.hw55_in_width = (subs==APP_DP_RES_RGB640x480_INP_SUBSAMPLE_1X||subs==APP_DP_RES_YUV640x480_INP_SUBSAMPLE_1X)?
-    		640:(subs==APP_DP_RES_RGB640x480_INP_SUBSAMPLE_2X||subs==APP_DP_RES_YUV640x480_INP_SUBSAMPLE_2X)?
-    		320:(subs==APP_DP_RES_RGB640x480_INP_SUBSAMPLE_4X||subs==APP_DP_RES_YUV640x480_INP_SUBSAMPLE_4X)?
-    		160:640;//DP_HW5X5_CROP_WIDTH;
-    /* JPEG encoder on this SoC requires both dimensions to be a multiple of
-     * 16 (see cisdp_cfg.h's "DP JPEG CFG" LIMITATION comment) - true for
-     * every subsample option except 4X, whose 160x120 has a height (120)
-     * that isn't (confirmed on hardware: JPEG's output DMA channel never
-     * completes, tripping EVT_INDEX_EDM_WDT2_TIMEOUT, permanently stalling
-     * the sensor with zero frames ever produced). Crop the *encoded* height
-     * down to 112 (160x112, both multiples of 16) rather than padding up to
-     * 128 - this only discards 8 real bottom rows already present in the
-     * 4X-subsampled frame instead of fabricating rows that were never
-     * actually captured. Width (160) is already a multiple of 16, so it's
-     * untouched. */
-    hw5x5_cfg.hw55_in_height = (subs==APP_DP_RES_RGB640x480_INP_SUBSAMPLE_1X||subs==APP_DP_RES_YUV640x480_INP_SUBSAMPLE_1X)?
-    		480:(subs==APP_DP_RES_RGB640x480_INP_SUBSAMPLE_2X||subs==APP_DP_RES_YUV640x480_INP_SUBSAMPLE_2X)?
-    		240:(subs==APP_DP_RES_RGB640x480_INP_SUBSAMPLE_4X||subs==APP_DP_RES_YUV640x480_INP_SUBSAMPLE_4X)?
-			112:480;//DP_HW5X5_CROP_HEIGHT;
+    hw5x5_cfg.hw55_crop_sty = DP_HW5X5_CROP_START_Y;
+    hw5x5_cfg.hw55_in_width = roi_w;
+    hw5x5_cfg.hw55_in_height = roi_h;
 
     //JPEG Cfg
     jpeg_cfg.jpeg_path = DP_JPEG_PATH;
-    jpeg_cfg.enc_width = (subs==APP_DP_RES_RGB640x480_INP_SUBSAMPLE_1X||subs==APP_DP_RES_YUV640x480_INP_SUBSAMPLE_1X)?
-    		640:(subs==APP_DP_RES_RGB640x480_INP_SUBSAMPLE_2X||subs==APP_DP_RES_YUV640x480_INP_SUBSAMPLE_2X)?
-    		320:(subs==APP_DP_RES_RGB640x480_INP_SUBSAMPLE_4X||subs==APP_DP_RES_YUV640x480_INP_SUBSAMPLE_4X)?
-    		160:640;//DP_JPEG_ENC_WIDTH;
-    jpeg_cfg.enc_height = (subs==APP_DP_RES_RGB640x480_INP_SUBSAMPLE_1X||subs==APP_DP_RES_YUV640x480_INP_SUBSAMPLE_1X)?
-    		480:(subs==APP_DP_RES_RGB640x480_INP_SUBSAMPLE_2X||subs==APP_DP_RES_YUV640x480_INP_SUBSAMPLE_2X)?
-    		240:(subs==APP_DP_RES_RGB640x480_INP_SUBSAMPLE_4X||subs==APP_DP_RES_YUV640x480_INP_SUBSAMPLE_4X)?
-			112:480;//DP_JPEG_ENC_HEIGHT;
+    jpeg_cfg.enc_width = roi_w;
+    jpeg_cfg.enc_height = roi_h;
     jpeg_cfg.jpeg_enctype = DP_JPEG_ENCTYPE;
     jpeg_cfg.jpeg_encqtable = DP_JPEG_ENCQTABLE;
 
@@ -623,43 +629,21 @@ uint32_t app_get_raw_addr()
 
 uint32_t app_get_raw_sz()
 {
-	if(g_subs == APP_DP_RES_YUV640x480_INP_SUBSAMPLE_1X)
-		return 460800;//640*480*1.5;
-	else if(g_subs == APP_DP_RES_YUV640x480_INP_SUBSAMPLE_2X)
-		return 115200;//320*240*1.5;
-	else if(g_subs == APP_DP_RES_YUV640x480_INP_SUBSAMPLE_4X)
-		return 26880;//160*112*1.5 (cropped from 120 to 112 - see cisdp_dp_init())
-	else if(g_subs == APP_DP_RES_RGB640x480_INP_SUBSAMPLE_1X)
-		return 921600;//640*480*3;
-	else if(g_subs == APP_DP_RES_RGB640x480_INP_SUBSAMPLE_2X)
-		return 230400;//320*240*3;
-	else if(g_subs == APP_DP_RES_RGB640x480_INP_SUBSAMPLE_4X)
-		return 53760;//160*112*3 (cropped from 120 to 112 - see cisdp_dp_init())
-	else
-		return 640*480*3;
+	uint16_t w, h, stx, sty;
+	subs_get_roi(g_subs, &w, &h, &stx, &sty);
+	return (uint32_t)w * h * 3 / (subs_is_rgb(g_subs) ? 1 : 2);
 }
 
 uint32_t app_get_raw_width() {
-
-	if(g_subs == APP_DP_RES_RGB640x480_INP_SUBSAMPLE_1X||g_subs == APP_DP_RES_YUV640x480_INP_SUBSAMPLE_1X)
-		return 640;
-	else if(g_subs == APP_DP_RES_RGB640x480_INP_SUBSAMPLE_2X||g_subs == APP_DP_RES_YUV640x480_INP_SUBSAMPLE_2X)
-		return 320;
-	else if(g_subs == APP_DP_RES_RGB640x480_INP_SUBSAMPLE_4X||g_subs == APP_DP_RES_YUV640x480_INP_SUBSAMPLE_4X)
-		return 160;
-	else
-		return 640;
+	uint16_t w, h, stx, sty;
+	subs_get_roi(g_subs, &w, &h, &stx, &sty);
+	return w;
 }
 
 uint32_t app_get_raw_height() {
-	if(g_subs == APP_DP_RES_RGB640x480_INP_SUBSAMPLE_1X||g_subs == APP_DP_RES_YUV640x480_INP_SUBSAMPLE_1X)
-		return 480;
-	else if(g_subs == APP_DP_RES_RGB640x480_INP_SUBSAMPLE_2X||g_subs == APP_DP_RES_YUV640x480_INP_SUBSAMPLE_2X)
-		return 240;
-	else if(g_subs == APP_DP_RES_RGB640x480_INP_SUBSAMPLE_4X||g_subs == APP_DP_RES_YUV640x480_INP_SUBSAMPLE_4X)
-		return 112; /* cropped from 120 to satisfy the JPEG encoder's height-must-be-a-multiple-of-16 requirement - see cisdp_dp_init() */
-	else
-		return 480;
+	uint16_t w, h, stx, sty;
+	subs_get_roi(g_subs, &w, &h, &stx, &sty);
+	return h;
 }
 
 uint32_t app_get_raw_channels() {

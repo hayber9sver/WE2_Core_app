@@ -135,6 +135,15 @@ void el_base64_encode(const unsigned char* in, int in_len, char* out) {
         }
     }
 
+    /* 2026-07-10: this tail (non-multiple-of-3 remainder) branch used to index
+     * char_array_4[i] here (i, not j) - i is left over from the main loop above
+     * and never changes across these iterations, so every output char in a
+     * partial group came out identical and wrong. Found via AT+INFO? end-to-end
+     * base64 round-trip testing (at_protocol_test_logs/run_20260710_120617);
+     * this same function backs send_base64_streamed()'s final partial chunk,
+     * so every AT+SAMPLE/AT+INVOKE image whose byte length wasn't a multiple of
+     * 768 (CHUNK_RAW) has had its last 1-3 base64 chars silently wrong too -
+     * mostly unnoticed because JPEG decoders tolerate a garbled/missing EOI. */
     if (i) {
         for (j = i; j < 3; j++) char_array_3[j] = '\0';
 
@@ -143,7 +152,7 @@ void el_base64_encode(const unsigned char* in, int in_len, char* out) {
         char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
         char_array_4[3] = char_array_3[2] & 0x3f;
 
-        for (j = 0; j < i + 1; j++) *out++ = BASE64_CHARS_TABLE[char_array_4[i]];
+        for (j = 0; j < i + 1; j++) *out++ = BASE64_CHARS_TABLE[char_array_4[j]];
 
         while (i++ < 3) *out++ = '=';
     }
@@ -719,9 +728,7 @@ std::string model_info_2_json_str(el_model_info_t model_info) {
                           std::to_string(model_info.size),
                           "}");
 }
-void send_device_id() {
-    std::string cmd;
-
+void send_name_reply() {
     const auto& ss{concat_strings("\r{\"type\": 0, \"name\": \"",
                                   "NAME?",
                                   "\", \"code\": ",
@@ -730,8 +737,10 @@ void send_device_id() {
                                   quoted("kris Grove Vision AI (WE2)"),
                                   "}\n")};
     send_bytes(ss.c_str(), ss.size());
+}
 
-    const auto& ss_ver{concat_strings("\r{\"type\": 0, \"name\": \"",
+void send_ver_reply() {
+    const auto& ss{concat_strings("\r{\"type\": 0, \"name\": \"",
                                   "VER?",
                                   "\", \"code\": ",
                                   std::to_string(EL_OK),
@@ -740,53 +749,56 @@ void send_device_id() {
                                   "\", \"hardware\": \"",
                                   "kris 2024",
                                   "\"}}\n")};
-    send_bytes(ss_ver.c_str(), ss_ver.size());
+    send_bytes(ss.c_str(), ss.size());
+}
 
-
-
-    const auto& ss_id{concat_strings("\r{\"type\": 0, \"name\": \"",
+void send_id_reply() {
+    const auto& ss{concat_strings("\r{\"type\": 0, \"name\": \"",
                                   "ID?",
                                   "\", \"code\": ",
                                   std::to_string(EL_OK),
                                   ", \"data\": ",
                                   "1",
                                   "}\n")};
-    send_bytes(ss_id.c_str(), ss_id.size());
+    send_bytes(ss.c_str(), ss.size());
+}
 
-     /* himax_vision.py's _fetch_model() base64-decodes "info" then json.loads
-      * it, so (unlike the app this file was copied from) the field really
-      * has to carry base64(JSON), not raw text. */
-     char info_json[256]{};
-     int  info_json_len = std::snprintf(info_json, sizeof(info_json),
-                     "{\"name\": \"Person Detect\", \"category\": \"Classification\", "
-                     "\"algorithm\": \"IMCLS\", \"classes\": [\"no_person\", \"person\"]}");
-     char info_b64[352]{};
-     el_base64_encode(reinterpret_cast<unsigned char*>(info_json), info_json_len, info_b64);
-
-     const auto& ss_info{
-      concat_strings("\r{\"type\": 0, \"name\": \"",
-                     "INFO?",
-                     "\", \"code\": ",
-                     std::to_string(EL_OK),
-                     ", \"data\": {\"crc16_maxim\": ",
-                     std::to_string(el_crc16_maxim(reinterpret_cast<uint8_t*>(info_json), info_json_len)),
-                     ", \"info\": ",
-                     quoted(info_b64),
-                     "}}\n")};
-    send_bytes(ss_info.c_str(), ss_info.size());
+el_model_info_t current_model_info() {
     el_model_info_t model_info{};
-    model_info.id=0;
-    model_info.type=EL_ALGO_TYPE_IMCLS;
+    model_info.id = 0;
+    model_info.type = EL_ALGO_TYPE_YOLO;
+    model_info.addr_flash = MODEL_FLASH_ADDR;
+    model_info.size = MODEL_FLASH_SIZE;
+    return model_info;
+}
 
-    const auto& ss_model_info{concat_strings("\r{\"type\": 0, \"name\": \"",
-                                  "MODEL?",
-                                  "\", \"code\": ",
-                                  std::to_string(EL_OK),
-                                  ", \"data\": ",
-                                  model_info_2_json_str(model_info),
-                                  "}\n")};
-    send_bytes(ss_model_info.c_str(), ss_model_info.size());
+void send_info_reply() {
+    /* himax_vision.py's _fetch_model() base64-decodes "info" then json.loads
+     * it, so (unlike the app this file was copied from) the field really
+     * has to carry base64(JSON), not raw text.
+     *
+     * 2026-07-10: was still describing the old compiled-in 2-class person-
+     * detect model ("Person Detect"/IMCLS/no_person,person) after the app
+     * moved to the flash-loaded 3-class Swift-YOLO gesture model - fixed to
+     * match what run_yolo_detect() (cvapp.cpp) actually reports. */
+    char info_json[256]{};
+    int  info_json_len = std::snprintf(info_json, sizeof(info_json),
+                    "{\"name\": \"Gesture Detect\", \"category\": \"Detection\", "
+                    "\"algorithm\": \"YOLOV5\", \"classes\": [\"paper\", \"rock\", \"scissors\"]}");
+    char info_b64[352]{};
+    el_base64_encode(reinterpret_cast<unsigned char*>(info_json), info_json_len, info_b64);
 
+    const auto& ss{
+     concat_strings("\r{\"type\": 0, \"name\": \"",
+                    "INFO?",
+                    "\", \"code\": ",
+                    std::to_string(EL_OK),
+                    ", \"data\": {\"crc16_maxim\": ",
+                    std::to_string(el_crc16_maxim(reinterpret_cast<uint8_t*>(info_json), info_json_len)),
+                    ", \"info\": ",
+                    quoted(info_b64),
+                    "}}\n")};
+    send_bytes(ss.c_str(), ss.size());
 }
 
 std::string  algo_tick_2_json_str(uint32_t algo_tick) {

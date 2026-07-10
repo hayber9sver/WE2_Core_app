@@ -101,6 +101,13 @@ static int      g_result_only = 0;
  * own default (ma_model_detector.cpp: threshold_score_(0.25)). */
 static uint8_t  g_tscore = 25;
 
+/* 45 matches cvapp.cpp's former NMS_IOU_THRESHOLD compile-time default
+ * (0.45, itself ground-truthed against SSCMA-Micro's ma_model_detector.cpp
+ * threshold_nms_(0.45)) - now runtime-adjustable via AT+TIOU. */
+static uint8_t  g_tiou = 45;
+
+static uint32_t g_boot_count = 0;
+
 /* -1 = no resolution change pending; otherwise an APP_DP_INP_SUBSAMPLE_E
  * value cam_task should switch to. Set by audio_task (via AT+SENSOR),
  * consumed by cam_task. */
@@ -115,6 +122,9 @@ void app_set_result_only(int result_only) { g_result_only = result_only; }
 int app_get_result_only(void) { return g_result_only; }
 void app_set_tscore(uint8_t score) { g_tscore = score; }
 uint8_t app_get_tscore(void) { return g_tscore; }
+void app_set_tiou(uint8_t iou) { g_tiou = iou; }
+uint8_t app_get_tiou(void) { return g_tiou; }
+uint32_t app_get_boot_count(void) { return g_boot_count; }
 
 void app_request_cam_resolution(int subs)
 {
@@ -291,6 +301,34 @@ int sscma_cam_mic_app(void)
     hx_drv_pmu_get_ctrl(PMU_pmu_wakeup_EVT, &wakeup_event);
     hx_drv_pmu_get_ctrl(PMU_pmu_wakeup_EVT1, &wakeup_event1);
     xprintf("wakeup_event=0x%x,WakeupEvt1=0x%x\n", wakeup_event, wakeup_event1);
+
+    /* AT+STAT?'s boot_count: "appused1" is a free AON scratch register (this
+     * app doesn't use it for anything else - unlike some sibling apps in
+     * this repo that pack a model/transport-selector byte into it, see
+     * send_result.cpp's comment).
+     *
+     * KNOWN LIMITATION (hardware-confirmed 2026-07-10, at_protocol_test_logs/
+     * run_20260710_122048): this does NOT actually count boots. The original
+     * assumption - AON survives a CPU-level reset and only clears on a real
+     * power cycle - is wrong on this chip for a *software-triggered* reset:
+     * AT+RST's NVIC_SystemReset() was confirmed (via raw serial capture,
+     * full bootloader banner observed) to genuinely reboot the board, yet
+     * appused1 read back cleared afterwards, so boot_count stayed at 1
+     * across the reset instead of incrementing to 2. The AON registers that
+     * *do* survive in this SDK (hx_drv_swreg_aon_set_rerest_cm55s_flag,
+     * set_ota_flag, etc.) appear to be specifically for the PMU-driven
+     * low-power wake path, not a plain CPU self-reset - untested whether
+     * appused1 would survive *that* kind of reset instead, but AT+RST is the
+     * only reset path this app actually exercises. A real persistent counter
+     * would need flash-backed storage (with the wear-per-boot tradeoff that
+     * implies) - out of scope for now, per explicit direction: leave this as
+     * a known limitation rather than add flash persistence. Practically,
+     * boot_count will read back 1 after every AT+RST; only a genuine power
+     * cycle changes that (and even then, only if appused1's power-loss reset
+     * value happens to differ from what was last written - not verified). */
+    hx_drv_swreg_aon_get_appused1(&g_boot_count);
+    g_boot_count++;
+    hx_drv_swreg_aon_set_appused1(g_boot_count);
 
     /* Required before reading a flash-loaded (FLASH_XIP_MODEL=1) model:
      * without this, tflite::GetModel(MODEL_FLASH_ADDR) reads back whatever

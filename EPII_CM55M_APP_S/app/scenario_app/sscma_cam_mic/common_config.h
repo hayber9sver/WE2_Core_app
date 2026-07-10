@@ -46,4 +46,9 @@
  * If a future model swap changes size materially, re-check this math. */
 #define MODEL_FLASH_ADDR 0x3AB7B000
 
+/* Matches the "Sizing" note above - used only to fill in AT+INVOKE's
+ * "model":{"size":...} field (see at_cmd.cpp). Not read back from flash at
+ * runtime; re-check this if the flashed model ever changes materially. */
+#define MODEL_FLASH_SIZE 824016
+
 #endif /* APP_SCENARIO_ALLON_SENSOR_TFLM_COMMON_CONFIG_H_ */

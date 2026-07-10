@@ -17,6 +17,9 @@ extern "C" {
 }
 #include <cstdint>
 #include <string>
+#include "WE2_device.h"    /* NVIC_SystemReset() for AT+RST */
+#include "FreeRTOS.h"
+#include "task.h"          /* xTaskGetTickCount() for AT+BREAK's timestamp */
 #include "send_result.h"
 #include "at_cmd.h"
 
@@ -43,6 +46,46 @@ static long parse_nth_int(char* args, int index, long fallback)
     return tok ? strtol(tok, nullptr, 10) : fallback;
 }
 
+/* AT+SENSOR/AT+SENSORS opt table. 2026-07-10: replaced the old 320x240/
+ * 160x112 options - those were never a true full-FOV downscale (see
+ * cisdp_cfg.h's enum comment), just a top-left crop of the sensor image.
+ * These are real *centered* square crops (see cisdp_sensor.c's
+ * subs_get_roi()), useful for future square-input models. Indexed by
+ * opt_id (0/1/2, largest last to match the AT protocol spec's own
+ * AT+SENSORS? example ordering). */
+struct sensor_opt_t { int opt_id; int width; int height; const char* detail; APP_DP_INP_SUBSAMPLE_E subs; };
+static const sensor_opt_t kSensorOpts[3] = {
+    {0, 240, 240, "240x240 Auto", APP_DP_RES_RGB640x480_INP_CROP_240x240},
+    {1, 480, 480, "480x480 Auto", APP_DP_RES_RGB640x480_INP_CROP_480x480},
+    {2, 640, 480, "640x480 Auto", APP_DP_RES_RGB640x480_INP_SUBSAMPLE_1X},
+};
+/* Tracks the opt_id AT+SENSOR last requested (default matches g_cam_subs'
+ * own default in sscma_cam_mic.c - APP_DP_RES_RGB640x480_INP_SUBSAMPLE_1X).
+ * app_request_cam_resolution() is asynchronous (cam_task applies it within
+ * the next couple of frames - see its comment), so this reflects the last
+ * *requested* resolution, not necessarily what's mid-frame on the wire this
+ * instant - same caveat the protocol's own opt_id/opt_detail fields have on
+ * any asynchronous sensor. */
+static int s_sensor_opt = 2;
+
+static std::string sensor_info_json()
+{
+    const sensor_opt_t& o = kSensorOpts[s_sensor_opt];
+    return concat_strings("{\"id\": 1, \"type\": 1, \"state\": 2, \"opt_id\": ",
+                           std::to_string(o.opt_id), ", \"opt_detail\": \"", o.detail, "\"}");
+}
+
+/* 2026-07-10: cmd_invoke/cmd_sample/cmd_asample used to all reply with
+ * send_device_id() - a leftover placeholder that blasted NAME?/VER?/ID?/
+ * INFO?/MODEL? back-to-back regardless of which command was actually sent,
+ * with the wrong "name" field on every one of them (e.g. AT+INVOKE's first
+ * reply claimed to be "NAME?"). The AT protocol (at-protocol-en_US.md)
+ * requires each Execute operation to reply with its OWN correctly-named
+ * Operation Response; the actual per-frame results still go out separately
+ * via event_reply_named("INVOKE"/"SAMPLE", ...) in cvapp.cpp, unaffected by
+ * this fix - capture_cam_mic.py already only reads those event replies, not
+ * this one, so this was a silent protocol violation rather than something
+ * that broke the existing tooling. */
 static void cmd_invoke(const char* args)
 {
     char buf[LINE_BUF_SIZE];
@@ -52,22 +95,41 @@ static void cmd_invoke(const char* args)
 
     app_set_result_only(result_only != 0);
     app_set_cam_stream_mode(CAM_STREAM_INVOKE);
-    send_device_id();
+
+    std::string data = concat_strings(
+        "{\"model\": ", model_info_2_json_str(current_model_info()),
+        ", \"algorithm\": {\"type\": 3, \"category\": 1, \"input_from\": 1, \"config\": {",
+        "\"tscore\": ", std::to_string(app_get_tscore()),
+        ", \"tiou\": ", std::to_string(app_get_tiou()), "}}",
+        ", \"sensor\": ", sensor_info_json(), "}");
+    reply_simple("INVOKE", EL_OK, data);
 }
 
 static void cmd_sample(const char*)
 {
     app_set_cam_stream_mode(CAM_STREAM_SAMPLE);
-    send_device_id();
+    reply_simple("SAMPLE", EL_OK, concat_strings("{\"sensor\": ", sensor_info_json(), "}"));
 }
 
+/* Not in the AT protocol spec (audio sampling has no equivalent there) -
+ * app-specific extension, mirrors AT+SAMPLE's reply shape. */
 static void cmd_asample(const char*)
 {
     if (!pdm_audio_is_running()) {
         pdm_audio_start();
     }
     app_set_audio_streaming(1);
-    send_device_id();
+    reply_simple("ASAMPLE", EL_OK,
+                 concat_strings("{\"sample_rate\": ", std::to_string(pdm_audio_get_rate()), "}"));
+}
+
+/* 2026-07-10: added for symmetry with the spec's own AT+SAMPLE?/AT+INVOKE?
+ * ("Get sample status"/"Get invoke status" - bare 0/1, not an object) - this
+ * app previously had no way to ask "is audio currently streaming?" short of
+ * tracking client-side state yourself. */
+static void cmd_asample_query()
+{
+    reply_simple("ASAMPLE?", EL_OK, app_get_audio_streaming() ? "1" : "0");
 }
 
 static void cmd_break(const char*)
@@ -77,6 +139,10 @@ static void cmd_break(const char*)
     app_set_cam_stream_mode(CAM_STREAM_IDLE);
     app_set_audio_streaming(0);
     pdm_audio_stop();
+    /* Spec's "data" field is a timestamp (device uptime in ms) - see
+     * at-protocol-en_US.md's "Stop all running tasks" example. */
+    reply_simple("BREAK", EL_OK,
+                 std::to_string((uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS)));
 }
 
 static void cmd_asr(const char* args, bool is_query)
@@ -105,6 +171,25 @@ static void cmd_tscore(const char* args, bool is_query)
     reply_simple("TSCORE", EL_OK, std::to_string(app_get_tscore()));
 }
 
+/* NMS IoU threshold - drives cvapp.cpp's run_nms() (see app_get_tiou()'s
+ * declaration in sscma_cam_mic.h). Added 2026-07-10 alongside TSCORE so both
+ * detection knobs are tunable live instead of only one of them. */
+static void cmd_tiou(const char* args, bool is_query)
+{
+    if (is_query) {
+        reply_simple("TIOU?", EL_OK, std::to_string(app_get_tiou()));
+        return;
+    }
+    long v = strtol(args, nullptr, 10);
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    app_set_tiou((uint8_t)v);
+    reply_simple("TIOU", EL_OK, std::to_string(app_get_tiou()));
+}
+
+/* RGB640x480_* (not YUV640x480_*): the YOLO detect model needs a 3-channel
+ * RGB raw buffer, not the grayscale-Y-plane-only YUV420 the old person-
+ * detect model used - see cisdp_sensor.c's demosbuf sizing. */
 static void cmd_sensor(const char* args)
 {
     char buf[LINE_BUF_SIZE];
@@ -112,38 +197,69 @@ static void cmd_sensor(const char* args)
     buf[sizeof(buf) - 1] = '\0';
     long opt = parse_nth_int(buf, 2, -1);
 
-    /* OV5647's datapath only has three real digital-downscale sizes off its
-     * native 640x480 binned output (1X/2X/4X subsample) - there is no 240x240
-     * option, and nothing larger without disabling binning entirely (a
-     * different sensor init table, out of scope here). opt=2/1/0 map to
-     * 640x480/320x240/160x112, matching the SENSOR-resolution ordering used
-     * elsewhere in this protocol (largest first).
-     *
-     * opt=0 is 160x112, not the "native" 160x120 4X subsample: the JPEG
-     * encoder on this SoC requires both dimensions to be a multiple of 16
-     * (confirmed on hardware - 120 isn't, and produced a permanent
-     * EVT_INDEX_EDM_WDT2_TIMEOUT with zero frames ever coming out), so
-     * cisdp_dp_init() crops the encoded height down to 112 (real captured
-     * rows, not padding) to satisfy that. app_get_raw_height() already
-     * reflects this, so the resize into the model's input tensor still
-     * lines up.
-     *
-     * RGB640x480_* (not YUV640x480_*): the YOLO detect model needs a
-     * 3-channel RGB raw buffer, not the grayscale-Y-plane-only YUV420 the
-     * old person-detect model used - see cisdp_sensor.c's demosbuf sizing. */
-    int width, height, subs;
-    switch (opt) {
-    case 2: width = 640; height = 480; subs = APP_DP_RES_RGB640x480_INP_SUBSAMPLE_1X; break;
-    case 1: width = 320; height = 240; subs = APP_DP_RES_RGB640x480_INP_SUBSAMPLE_2X; break;
-    case 0: width = 160; height = 112; subs = APP_DP_RES_RGB640x480_INP_SUBSAMPLE_4X; break;
-    default:
-        reply_simple("SENSOR", EL_EINVAL, "\"opt must be 0 (160x112), 1 (320x240), or 2 (640x480)\"");
+    if (opt < 0 || opt > 2) {
+        reply_simple("SENSOR", EL_EINVAL, "\"opt_id must be 0 (240x240), 1 (480x480), or 2 (640x480)\"");
         return;
     }
 
-    app_request_cam_resolution(subs);
-    reply_simple("SENSOR", EL_OK,
-                 concat_strings("{\"resolution\": [", std::to_string(width), ", ", std::to_string(height), "]}"));
+    s_sensor_opt = (int)opt;
+    app_request_cam_resolution((int)kSensorOpts[s_sensor_opt].subs);
+    reply_simple("SENSOR", EL_OK, concat_strings("{\"sensor\": ", sensor_info_json(), "}"));
+}
+
+static void cmd_sensor_query()
+{
+    reply_simple("SENSOR?", EL_OK, sensor_info_json());
+}
+
+static void cmd_sensors_query()
+{
+    const sensor_opt_t& cur = kSensorOpts[s_sensor_opt];
+    std::string opts = concat_strings(
+        "{\"2\": \"", kSensorOpts[2].detail, "\"",
+        ", \"1\": \"", kSensorOpts[1].detail, "\"",
+        ", \"0\": \"", kSensorOpts[0].detail, "\"}");
+    reply_simple("SENSORS?", EL_OK,
+                 concat_strings("{\"id\": 1, \"type\": 1, \"state\": 2, \"opt_id\": ",
+                                std::to_string(cur.opt_id), ", \"opt_detail\": \"", cur.detail,
+                                "\", \"opts\": ", opts, "}"));
+}
+
+static void cmd_stat_query()
+{
+    reply_simple("STAT?", EL_OK,
+                 concat_strings("{\"boot_count\": ", std::to_string(app_get_boot_count()),
+                                ", \"is_ready\": 1}"));
+}
+
+static void cmd_rst()
+{
+    /* No-reply per protocol (Reserved operation, see "Reboot device" in
+     * at-protocol-en_US.md) - never returns. */
+    NVIC_SystemReset();
+}
+
+static void cmd_help()
+{
+    /* Raw text, not a JSON envelope - matches the protocol's own AT+HELP?
+     * example, which is a plain command list rather than an Operation
+     * Response. */
+    static const char help_text[] =
+        "Command list:\n"
+        "  AT+INVOKE=<n_times,differed,result_only>  camera + YOLO gesture inference loop\n"
+        "  AT+SAMPLE=<n_times>                       raw camera stream, no inference\n"
+        "  AT+ASAMPLE=<n_times>/AT+ASAMPLE?          start/query raw DMIC/PDM audio stream (binary frames)\n"
+        "  AT+BREAK                                  stop whichever stream is active\n"
+        "  AT+ASR=<rate>/AT+ASR?                     set/query the PDM sample rate\n"
+        "  AT+TSCORE=<0..100>/AT+TSCORE?             detection score threshold\n"
+        "  AT+TIOU=<0..100>/AT+TIOU?                 NMS IoU threshold\n"
+        "  AT+SENSOR=<id,enable,opt_id>/AT+SENSOR?   set/query camera resolution\n"
+        "  AT+SENSORS?                               list available camera resolutions\n"
+        "  AT+STAT?                                  boot count / ready state\n"
+        "  AT+ID?/AT+NAME?/AT+VER?/AT+INFO?          device identity\n"
+        "  AT+RST                                    reboot\n"
+        "  AT+HELP?                                  this list\n";
+    send_bytes(help_text, sizeof(help_text) - 1);
 }
 
 static void process_line(char* line)
@@ -171,19 +287,37 @@ static void process_line(char* line)
     } else if (strcmp(name, "SAMPLE") == 0) {
         cmd_sample(args);
     } else if (strcmp(name, "ASAMPLE") == 0) {
-        cmd_asample(args);
+        if (is_query) cmd_asample_query();
+        else cmd_asample(args);
     } else if (strcmp(name, "BREAK") == 0) {
         cmd_break(args);
     } else if (strcmp(name, "ASR") == 0) {
         cmd_asr(args, is_query);
     } else if (strcmp(name, "TSCORE") == 0) {
         cmd_tscore(args, is_query);
+    } else if (strcmp(name, "TIOU") == 0) {
+        cmd_tiou(args, is_query);
+    } else if (strcmp(name, "SENSORS") == 0) {
+        if (is_query) cmd_sensors_query();
+        else reply_simple("SENSORS", EL_ENOTSUP, "\"read-only\"");
     } else if (strcmp(name, "SENSOR") == 0) {
-        cmd_sensor(args);
-    } else if (is_query && (strcmp(name, "INFO") == 0 || strcmp(name, "NAME") == 0 ||
-                             strcmp(name, "VER") == 0 || strcmp(name, "ID") == 0 ||
-                             strcmp(name, "MODEL") == 0)) {
-        send_device_id();
+        if (is_query) cmd_sensor_query();
+        else cmd_sensor(args);
+    } else if (strcmp(name, "STAT") == 0) {
+        if (is_query) cmd_stat_query();
+        else reply_simple("STAT", EL_ENOTSUP, "\"read-only\"");
+    } else if (strcmp(name, "RST") == 0) {
+        cmd_rst();
+    } else if (strcmp(name, "HELP") == 0) {
+        cmd_help();
+    } else if (is_query && strcmp(name, "NAME") == 0) {
+        send_name_reply();
+    } else if (is_query && strcmp(name, "VER") == 0) {
+        send_ver_reply();
+    } else if (is_query && strcmp(name, "ID") == 0) {
+        send_id_reply();
+    } else if (is_query && strcmp(name, "INFO") == 0) {
+        send_info_reply();
     } else {
         reply_simple(name, EL_EINVAL, "\"unsupported command\"");
     }

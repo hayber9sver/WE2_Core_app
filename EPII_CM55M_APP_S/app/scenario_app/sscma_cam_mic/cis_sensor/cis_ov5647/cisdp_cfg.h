@@ -30,14 +30,24 @@
 #include "hx_drv_gpio.h"
 #include "hx_drv_inp.h"
 
+/* 2026-07-10: the old _2X/_4X members were never a true full-FOV digital
+ * downscale - HW2x2's process_mode was HW2x2_MODE_UNITY (no binning) with a
+ * shrinking ROI *starting at (0,0)*, i.e. a top-left crop that threw away
+ * the right/bottom of the sensor image, not a resampled view of the whole
+ * frame. Replaced with real *centered* square crops (480x480/240x240) for
+ * future square-input models (SSCMA-style models are commonly trained
+ * square) - see cisdp_dp_init()'s hw_22_crop_stx/sty math. Both new sizes
+ * are already multiples of 16, so unlike the old 4X (160x120, cropped to
+ * 160x112 to satisfy the JPEG encoder - see cisdp_dp_init()) no JPEG-
+ * dimension workaround is needed. */
 typedef enum
 {
-	APP_DP_RES_RGB640x480_INP_SUBSAMPLE_1X,
-	APP_DP_RES_RGB640x480_INP_SUBSAMPLE_2X,
-	APP_DP_RES_RGB640x480_INP_SUBSAMPLE_4X,
+	APP_DP_RES_RGB640x480_INP_SUBSAMPLE_1X,   /* 640x480, full FOV, no crop */
+	APP_DP_RES_RGB640x480_INP_CROP_480x480,   /* 480x480, centered square crop */
+	APP_DP_RES_RGB640x480_INP_CROP_240x240,   /* 240x240, centered square crop */
 	APP_DP_RES_YUV640x480_INP_SUBSAMPLE_1X,
-	APP_DP_RES_YUV640x480_INP_SUBSAMPLE_2X,
-	APP_DP_RES_YUV640x480_INP_SUBSAMPLE_4X,
+	APP_DP_RES_YUV640x480_INP_CROP_480x480,
+	APP_DP_RES_YUV640x480_INP_CROP_240x240,
 }APP_DP_INP_SUBSAMPLE_E;
 
 #define OV5647_SENSOR_I2CID			(0x36)
