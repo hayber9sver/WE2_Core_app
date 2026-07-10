@@ -209,6 +209,26 @@ int cv_init(bool security_enable, bool privilege_enable)
 	input = static_interpreter.input(0);
 	output = static_interpreter.output(0);
 
+	/* Diagnostic: is the output tensor's quantization per-tensor (one shared
+	 * scale/zero_point) or per-channel (one per column of the [N,8] output -
+	 * x,y,w,h,obj,class0,class1,class2)? decode_boxes() currently assumes
+	 * per-tensor (scale->data[0]/zero_point->data[0] applied to every
+	 * column) - if size here is 8, not 1, that assumption is wrong and each
+	 * column needs its own scale[c]/zero_point[c]. Print once at boot,
+	 * cheap, not a hot-path cost like the per-row bbox dump. */
+	{
+		TfLiteAffineQuantization* q = (TfLiteAffineQuantization*)(output->quantization.params);
+		xprintf("[quant] output scale->size=%d zero_point->size=%d\n",
+			(int)q->scale->size, (int)q->zero_point->size);
+		for (int i = 0; i < q->scale->size; ++i) {
+			/* %f is unusable here - this app's newlib-nano isn't linked with
+			 * -u _printf_float (confirmed: no other xprintf in this codebase
+			 * uses %f), so print scale as a scaled integer instead. */
+			xprintf("[quant]   [%d] scale_x1e6=%ld zero_point=%d\n",
+				i, (long)(q->scale->data[i] * 1000000.0f), (int)q->zero_point->data[i]);
+		}
+	}
+
 	xprintf("initial done\n");
 
 	return ercode;
@@ -217,25 +237,36 @@ int cv_init(bool security_enable, bool privilege_enable)
 namespace {
 
 /* One decoded/NMS-ready candidate box, in MODEL_INPUT_W/H pixel space,
- * center-based (x,y = box center) - matches how every other model in this
- * SDK treats a raw detector's box output (see tflm_yolov8_od's
- * yolov8_ob_post_processing(), tflm_fd_fm's face bbox) before converting to
- * the wire's corner-based el_box_t at the very end. */
+ * TOP-LEFT-CORNER-based (x,y = box corner, not center) - see decode_boxes()'s
+ * comment for why; this is the opposite of what earlier reverse-engineering
+ * assumed. */
 struct yolo_box {
     float x, y, w, h;
     float score;
     int class_id;
 };
 
-#define NMS_IOU_THRESHOLD 0.55f  /* matches SSCMA Swift-YOLO's documented eval default */
+/* 2026-07-10: ground-truthed against Seeed's own reference decoder,
+ * SSCMA-Micro's YoloV5::generalPostProcess() (/home/orangepi/SSCMA-Micro/
+ * sscma/core/model/ma_model_yolov5.cpp) - Swift-YOLO is a YOLOv5 derivative
+ * and shares its post-processing. Default there is ma_model_detector.cpp's
+ * Detector() ctor: threshold_nms_(0.45). The earlier 0.1 was tuned against
+ * data corrupted by the center/corner bug (see decode_boxes()) - overlap
+ * looked pathological because boxes for the same hand were shifted by
+ * different amounts (proportional to each one's own w/2,h/2), not because
+ * real overlap was ever that high. Reverted to the reference's 0.45 now that
+ * the actual coordinates are correct. */
+#define NMS_IOU_THRESHOLD 0.45f
 #define MAX_YOLO_DETECTIONS 10
 
+/* Corner-based (x,y = top-left, matches ma_nms.h's compute_iou()) - NOT
+ * center-based like the pre-2026-07-10 version of this function. */
 static float box_iou(const yolo_box &a, const yolo_box &b)
 {
-    float ax1 = a.x - a.w / 2.0f, ay1 = a.y - a.h / 2.0f;
-    float ax2 = a.x + a.w / 2.0f, ay2 = a.y + a.h / 2.0f;
-    float bx1 = b.x - b.w / 2.0f, by1 = b.y - b.h / 2.0f;
-    float bx2 = b.x + b.w / 2.0f, by2 = b.y + b.h / 2.0f;
+    float ax1 = a.x, ay1 = a.y;
+    float ax2 = a.x + a.w, ay2 = a.y + a.h;
+    float bx1 = b.x, by1 = b.y;
+    float bx2 = b.x + b.w, by2 = b.y + b.h;
 
     float ix1 = std::max(ax1, bx1), iy1 = std::max(ay1, by1);
     float ix2 = std::min(ax2, bx2), iy2 = std::min(ay2, by2);
@@ -247,23 +278,77 @@ static float box_iou(const yolo_box &a, const yolo_box &b)
     return uni > 0.0f ? inter / uni : 0.0f;
 }
 
-static inline float sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
+/* 2026-07-10: plain IoU (above) misses the case where a small box sits
+ * almost entirely inside a much bigger one - the bigger box's extra area
+ * inflates the union, so IoU stays well under NMS_IOU_THRESHOLD even at
+ * 100% containment (hardware-confirmed: run_20260710_015017 log had pairs
+ * with containment=1.000 - the smaller box's corners were fully inside the
+ * larger one - yet IoU only 0.28-0.44, so plain-IoU NMS kept both as
+ * separate detections of what was clearly one hand). This is a known
+ * weakness of greedy IoU-NMS in general - SSCMA-Micro's own reference
+ * (ma_nms.cpp) has the identical gap, so this check is a deliberate,
+ * app-specific addition on top of the reference, not a spec deviation
+ * anyone will trip over expecting official parity. Returns intersection
+ * area as a fraction of the SMALLER box's own area. */
+static float box_containment(const yolo_box &a, const yolo_box &b)
+{
+    float ax1 = a.x, ay1 = a.y, ax2 = a.x + a.w, ay2 = a.y + a.h;
+    float bx1 = b.x, by1 = b.y, bx2 = b.x + b.w, by2 = b.y + b.h;
+
+    float ix1 = std::max(ax1, bx1), iy1 = std::max(ay1, by1);
+    float ix2 = std::min(ax2, bx2), iy2 = std::min(ay2, by2);
+    float iw = ix2 - ix1, ih = iy2 - iy1;
+    if (iw <= 0.0f || ih <= 0.0f) return 0.0f;
+
+    float inter = iw * ih;
+    float smaller = std::min(a.w * a.h, b.w * b.h);
+    return smaller > 0.0f ? inter / smaller : 0.0f;
+}
+/* 0.9, then 0.75, both still left real hardware-observed duplicate pairs
+ * unsuppressed (2026-07-10 - two rounds of hardware testing each found a
+ * fresh cluster sitting just under whatever threshold was current). Per
+ * user's direction: stop chasing a cutoff and suppress on ANY containment -
+ * i.e. any nonzero geometric overlap between two boxes at all means one is
+ * sitting (at least partly) inside the other, and for this app's single-
+ * hand-in-frame use case that's always the same hand, never two legitimately
+ * separate objects that happen to touch. threshold_iou above is effectively
+ * superseded by this (any overlap already implies containment > 0), kept
+ * only because it's what SSCMA-Micro's own reference NMS uses and there's no
+ * reason to diverge from a value that was never the problem. */
+#define NMS_CONTAINMENT_THRESHOLD 0.0f
 
 /* Decode the model's raw [num_boxes, 8] output tensor into candidate boxes
- * above score_threshold. Confirmed against the SSCMA Swift-YOLO 192 model
- * card (github.com/seeed-studio/sscma-model-zoo, Gesture_Detection_Swift-
- * YOLO_192.md): 3 classes (paper/rock/scissors), columns = [x, y, w, h,
- * objectness, class0, class1, class2] - NOT a single class_id (that was
- * the original wrong guess; on-hardware dump showed non-integer "class"
- * values and score/class magnitudes >>1, both inconsistent with an
- * already-decoded index/probability). objectness and the 3 class columns
- * are raw pre-sigmoid logits (confirmed by the model card's mAP-eval
- * confidence threshold of 0.001, which only makes sense applied to a
- * sigmoid-decoded probability). Final score = sigmoid(objectness) *
- * max_c(sigmoid(class_c)), standard YOLO combined-confidence formula;
- * class_id = argmax_c(sigmoid(class_c)). x,y,w,h are still assumed already
- * decoded to MODEL_INPUT_W/H pixel space (center-based) - on-hardware
- * values were plausible pixel coordinates, not [0,1] or wildly-scaled. */
+ * above score_threshold. Columns = [x, y, w, h, objectness, class0, class1,
+ * class2], 3 classes = paper/rock/scissors (hardware-confirmed 2026-07-10).
+ *
+ * 2026-07-10 rewrite: ground-truthed against SSCMA-Micro's own reference
+ * decoder for this exact model family, YoloV5::generalPostProcess() (see
+ * /home/orangepi/SSCMA-Micro/sscma/core/model/ma_model_yolov5.cpp - Swift-
+ * YOLO is a YOLOv5 derivative, confirmed by the user). Three things the
+ * earlier from-first-principles reverse-engineering (SSCMA model card + on-
+ * hardware raw-value inspection) got wrong, all now fixed to match the
+ * reference bit-for-bit:
+ *   1. NO sigmoid anywhere. The earlier assumption that objectness/class
+ *      were raw pre-sigmoid logits was wrong - the export already bakes
+ *      whatever activation it needs in, so the tensor's dequantized value
+ *      *is* the score (optionally /100 if the tensor's own scale implies a
+ *      0..100 range rather than 0..1 - see "normalized" below).
+ *   2. Final score is objectness ALONE, not objectness*best_class_score.
+ *      Class is only used to pick the label. And picking it doesn't even
+ *      need dequantizing: argmax over the raw int8 class bytes gives the
+ *      same answer as argmax over the dequantized floats (dequant is a
+ *      monotonic affine map, same scale/zero_point for every class column),
+ *      so the reference just compares raw bytes directly.
+ *   3. x,y are already the TOP-LEFT CORNER, not the box center - do not
+ *      subtract w/2,h/2. ma_nms.h's compute_iou() treats box.x/box.y as the
+ *      left/top edge with no center adjustment anywhere in the int8 code
+ *      path, and generalPostProcess() never applies one either. The earlier
+ *      "center-based" assumption was never verified against a reference,
+ *      just carried over from how tflm_yolov8_od's own (different) model
+ *      happens to encode its output - it silently shifted every reported
+ *      box up-left by its own half-width/half-height, which is also why
+ *      overlap between boxes for the same physical hand looked so
+ *      inconsistent (see NMS_IOU_THRESHOLD's comment above). */
 /* Hard cap on retained pre-NMS candidates. Fixed-size, stack/static-only -
  * no heap allocation anywhere in this per-frame hot path. This app runs
  * with very little SRAM slack (~60KB free once static buffers/tensor arena
@@ -286,8 +371,27 @@ int decode_boxes(TfLiteTensor* out, float score_threshold, yolo_box* boxes_out)
     int row_width = out->dims->data[dims - 1];
     int num_classes = row_width - 5;
 
-    float scale = ((TfLiteAffineQuantization*)(out->quantization.params))->scale->data[0];
-    int zero_point = ((TfLiteAffineQuantization*)(out->quantization.params))->zero_point->data[0];
+    /* Per-tensor vs per-channel quantization: if the output's scale/
+     * zero_point array has only 1 entry, every column (x,y,w,h,obj,class0..)
+     * shares it (what this code originally assumed). If it has row_width
+     * entries instead, each column has its own scale[c]/zero_point[c] and
+     * indexing everything with [0] would silently apply x's quant params to
+     * objectness/class - see cv_init()'s "[quant]" boot print for which case
+     * this model actually is. dequant() below is written to be correct
+     * either way. */
+    TfLiteAffineQuantization* quant = (TfLiteAffineQuantization*)(out->quantization.params);
+    bool per_channel = quant->scale->size > 1;
+    auto dequant = [&](int col, int8_t q) -> float {
+        int idx = per_channel ? col : 0;
+        return ((float)q - quant->zero_point->data[idx]) * quant->scale->data[idx];
+    };
+    /* ma_model_yolov5.cpp: "bool normalized = scale < 0.1f;" - if the
+     * objectness column's scale is small, the dequantized value already
+     * lands in ~[0,1] (a true probability); if not, it's ~[0,100] and needs
+     * /100 to match score_threshold's [0,1] scale. Reference always reads
+     * this off the (single, per-tensor) scale - mirrored here off column 4's
+     * in case this model turns out to be per-channel after all. */
+    bool normalized = quant->scale->data[per_channel ? 4 : 0] < 0.1f;
 
     /* Always scan every candidate and keep the kMaxCandidates HIGHEST-scoring
      * ones that pass threshold, evicting the current worst kept candidate
@@ -305,24 +409,27 @@ int decode_boxes(TfLiteTensor* out, float score_threshold, yolo_box* boxes_out)
 
     for (int i = 0; i < num_boxes; ++i) {
         const int8_t* row = out->data.int8 + i * row_width;
-        float objectness = sigmoidf(((float)row[4] - zero_point) * scale);
 
-        int best_class = 0;
-        float best_class_score = -1.0f;
-        for (int c = 0; c < num_classes; ++c) {
-            float cs = sigmoidf(((float)row[5 + c] - zero_point) * scale);
-            if (cs > best_class_score) { best_class_score = cs; best_class = c; }
-        }
-
-        float score = objectness * best_class_score;
+        float score = dequant(4, row[4]);
+        score = normalized ? score : score / 100.0f;
         if (score < score_threshold) continue;
         if (n >= kMaxCandidates && score <= min_score_in_out) continue;
 
+        /* argmax over raw int8 bytes directly - dequant is a monotonic
+         * affine map (same scale/zero_point across the class columns), so
+         * this picks the same class as argmax-over-dequantized-floats would,
+         * without needing to actually dequantize. */
+        int8_t max_class_raw = -128;
+        int best_class = 0;
+        for (int c = 0; c < num_classes; ++c) {
+            if (row[5 + c] > max_class_raw) { max_class_raw = row[5 + c]; best_class = c; }
+        }
+
         yolo_box b;
-        b.x = ((float)row[0] - zero_point) * scale;   /* assumed already pixel-space */
-        b.y = ((float)row[1] - zero_point) * scale;   /* assumed already pixel-space */
-        b.w = ((float)row[2] - zero_point) * scale;   /* assumed already pixel-space */
-        b.h = ((float)row[3] - zero_point) * scale;   /* assumed already pixel-space */
+        b.x = dequant(0, row[0]);   /* top-left corner, model-pixel space */
+        b.y = dequant(1, row[1]);   /* top-left corner, model-pixel space */
+        b.w = dequant(2, row[2]);
+        b.h = dequant(3, row[3]);
         b.score = score;
         b.class_id = best_class;
 
@@ -382,7 +489,13 @@ int run_nms(const yolo_box* boxes, int n, int* keep_out)
         for (int oj = oi + 1; oj < n; ++oj) {
             int j = order[oj];
             if (removed[j]) continue;
-            if (box_iou(boxes[i], boxes[j]) > NMS_IOU_THRESHOLD) removed[j] = true;
+            /* box_containment() (see its comment) catches the case plain IoU
+             * misses: a much-smaller box sitting almost entirely inside the
+             * kept one. */
+            if (box_iou(boxes[i], boxes[j]) > NMS_IOU_THRESHOLD ||
+                box_containment(boxes[i], boxes[j]) > NMS_CONTAINMENT_THRESHOLD) {
+                removed[j] = true;
+            }
         }
     }
     return n_keep;
@@ -439,8 +552,11 @@ int run_yolo_detect(std::forward_list<el_box_t> &out_boxes)
 
     for (int ki = 0; ki < n_keep; ++ki) {
         const yolo_box &b = boxes[keep[ki]];
-        float left = (b.x - b.w / 2.0f) * scale_x;
-        float top  = (b.y - b.h / 2.0f) * scale_y;
+        /* b.x/b.y are already the top-left corner (see decode_boxes()) - no
+         * center-to-corner subtraction here, unlike the pre-2026-07-10
+         * version of this function. */
+        float left = b.x * scale_x;
+        float top  = b.y * scale_y;
         if (left < 0.0f) left = 0.0f;
         if (top < 0.0f) top = 0.0f;
 

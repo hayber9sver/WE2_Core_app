@@ -91,7 +91,15 @@ static uint32_t g_cur_jpegenc_frame;
 static cam_stream_mode_e g_cam_mode = CAM_STREAM_IDLE;
 static volatile int g_audio_streaming = 0;
 static int      g_result_only = 0;
-static uint8_t  g_tscore = 50;
+/* 80 was tuned against the pre-2026-07-10 decode formula, which multiplied
+ * two sigmoid-saturated terms together (sigmoid(objectness)*sigmoid(class))
+ * and so ran numerically hot, clustering real detections up near 90-100.
+ * The corrected formula (cvapp.cpp's decode_boxes(), ground-truthed against
+ * SSCMA-Micro's own YoloV5::generalPostProcess()) uses objectness alone with
+ * no sigmoid, an entirely different numeric range - 80 would very likely
+ * threshold out every real detection now. Reset to the reference decoder's
+ * own default (ma_model_detector.cpp: threshold_score_(0.25)). */
+static uint8_t  g_tscore = 25;
 
 /* -1 = no resolution change pending; otherwise an APP_DP_INP_SUBSAMPLE_E
  * value cam_task should switch to. Set by audio_task (via AT+SENSOR),
