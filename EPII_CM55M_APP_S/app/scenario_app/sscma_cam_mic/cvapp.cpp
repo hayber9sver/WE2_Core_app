@@ -562,12 +562,32 @@ int run_yolo_detect(std::forward_list<el_box_t> &out_boxes)
         float top  = b.y * scale_y;
         if (left < 0.0f) left = 0.0f;
         if (top < 0.0f) top = 0.0f;
+        if (left > (float)img_w) left = (float)img_w;
+        if (top > (float)img_h) top = (float)img_h;
+
+        /* 2026-07-10: the model occasionally emits a candidate whose raw
+         * x+w/y+h already exceeds its own 192x192 input canvas (a noisy/
+         * spurious detection, not a resolution-scaling artifact - the
+         * model-space math here is resolution-independent) - nothing
+         * upstream ever clamped that, so it rendered as a box hanging far
+         * outside the actual frame once scaled to wire-space. Clamp the
+         * right/bottom edge independently of width/height so a bad
+         * candidate's box is truncated to the visible frame instead of
+         * spilling past it - hardware-confirmed via a captured log with
+         * boxes up to ~275px past a 480px-wide frame
+         * (tools/gesture_test_logs/run_20260710_130455). */
+        float right  = std::min((float)img_w, (b.x + b.w) * scale_x);
+        float bottom = std::min((float)img_h, (b.y + b.h) * scale_y);
+        float w = right - left;
+        float h = bottom - top;
+        if (w < 0.0f) w = 0.0f;
+        if (h < 0.0f) h = 0.0f;
 
         el_box_t box{};
         box.x      = (uint16_t)left;
         box.y      = (uint16_t)top;
-        box.w      = (uint16_t)(b.w * scale_x);
-        box.h      = (uint16_t)(b.h * scale_y);
+        box.w      = (uint16_t)w;
+        box.h      = (uint16_t)h;
         box.score  = (uint8_t)std::min(100.0f, b.score * 100.0f);
         box.target = (uint8_t)b.class_id;
         out_boxes.push_front(box);
@@ -605,6 +625,16 @@ void cam_handle_frame(void)
     /* CAM_STREAM_INVOKE */
     std::forward_list<el_box_t> boxes;
     if (run_yolo_detect(boxes) != 0) {
+        return;
+    }
+
+    /* 2026-07-12: skip the UART send entirely when nothing was detected,
+     * instead of always sending an INVOKE event (empty "boxes": [] or not).
+     * At tscore=25% most frames DO have a detection (~94% measured on the
+     * ESP32 bridge side), so this doesn't cut event volume much - but for
+     * the remaining empty frames it also skips the full JPEG payload in the
+     * non-result_only path, which is the expensive part on this UART link. */
+    if (boxes.empty()) {
         return;
     }
 

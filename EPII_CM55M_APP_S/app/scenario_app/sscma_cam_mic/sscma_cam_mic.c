@@ -281,7 +281,21 @@ static void cam_task(void *pvParameters)
 }
 
 /* audio_task body: AT-command parsing, audio-chunk draining and the UART1
- * echo probe all live here, independent of whatever cam_task is doing. */
+ * echo probe all live here, independent of whatever cam_task is doing.
+ *
+ * 2026-07-11: was vTaskDelay(pdMS_TO_TICKS(5)) - confirmed on hardware that
+ * a multi-byte AT command arriving from the ESP32C3 UART1 bridge can get
+ * silently truncated: WE2's UART1 RX is a bare 16-byte hardware FIFO
+ * (out_transport.c/send_result.cpp poll it directly, no interrupt/DMA
+ * draining), and at 921600 baud that FIFO fills in ~173us - far faster than
+ * this task was coming back around to drain it. Dropping to 1ms (the
+ * shortest step FreeRTOS's 1000Hz tick can express via vTaskDelay) cuts
+ * that exposure roughly 5x. This is a mitigation, not a fix: 1ms is still
+ * ~6x longer than the 173us fill time, so a burst that lands entirely
+ * inside one gap can still overrun - a hard guarantee needs interrupt- or
+ * DMA-driven RX instead of polling. Paired with shrinking the ESP32 bridge's
+ * per-command tag (app_httpd.cpp's CMD_TAG_FMT_STR) so most short commands
+ * fit under 16 bytes in the first place. */
 static void audio_task(void *pvParameters)
 {
     (void)pvParameters;
@@ -290,7 +304,7 @@ static void audio_task(void *pvParameters)
     {
         at_cmd_poll();
         out_transport_poll();
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 

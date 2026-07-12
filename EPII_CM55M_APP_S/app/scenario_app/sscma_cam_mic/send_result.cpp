@@ -2,6 +2,7 @@ extern "C" {
 #include <hx_drv_uart.h>
 #include "hx_drv_swreg_aon.h"
 #include "out_transport.h"
+#include "at_cmd.h"
 }
 #include <math.h>
 
@@ -25,22 +26,16 @@ extern "C" {
  * sent).
  */
 
-/* Reopening the UART on every single call (the original pattern here, one
- * uart_open() per byte in the read_bytes_nonblock() case since at_cmd_poll()
- * calls it once per byte) briefly resets the peripheral each time - confirmed
- * on hardware to occasionally drop an in-flight byte (a command's trailing
- * \r vanished mid-burst, observed via xprintf tracing). console_io.c's
- * console_setup() avoids this by only opening once; mirror that here, only
- * reopening when the active transport UART id actually changes. */
-static int       s_console_uart_id = -1;
-static DEV_UART*  get_console_uart(void) {
-    int id = out_transport_uart_id();
-    DEV_UART* console_uart = hx_drv_uart_get_dev((USE_DW_UART_E)id);
-    if (id != s_console_uart_id) {
-        console_uart->uart_open(UART_BAUDRATE_921600);
-        s_console_uart_id = id;
-    }
-    return console_uart;
+/* 2026-07-11: was reopening the UART whenever the active transport id
+ * changed (console_io.c's console_setup() pattern) - no longer needed now
+ * that out_transport_init() opens UART0 (lookup only, board_init() already
+ * opened it) and UART1 exactly once each, up front, before arming their DMA
+ * RX chains. Reopening here again would risk cancelling an in-flight
+ * uart_read_udma() on whichever UART just got reopened - see
+ * out_transport.c's own comment on why RX moved to interrupt/DMA. Just a
+ * lookup now; writes are the only thing this file still touches directly. */
+static DEV_UART* get_console_uart(void) {
+    return hx_drv_uart_get_dev((USE_DW_UART_E)out_transport_uart_id());
 }
 
 el_err_code_t send_bytes(const char* buffer, size_t size) {
@@ -63,43 +58,20 @@ el_err_code_t send_bytes(const char* buffer, size_t size) {
     return sent == pos_of_bytes ? EL_OK : EL_AGAIN;
 }
 
-
-el_err_code_t read_bytes(char* buffer, size_t size) {
-    out_transport_lock();
-    DEV_UART* console_uart = get_console_uart();
-
-    size_t read{0};
-    size_t pos_of_bytes{0};
-    while (size) {
-        size_t bytes_to_read{size < 8 ? size : 8};
-        read += console_uart->uart_read(buffer + pos_of_bytes, bytes_to_read);
-
-        pos_of_bytes += bytes_to_read;
-        size -= bytes_to_read;
-    }
-
-    out_transport_unlock();
-    return read > 0 ? EL_OK : EL_AGAIN;
-}
-
+/* 2026-07-11: RX now goes through out_transport.c's interrupt/DMA-fed ring
+ * buffer (out_transport_rx_pop()), not the DW_UART driver directly - see
+ * that file's comment for why (16-byte hardware FIFO, task-polling can't
+ * reliably drain it in time). read_bytes() (blocking, whole-hardware-FIFO
+ * poll) had no callers anywhere in this app and doesn't have an equivalent
+ * in the new model - removed rather than left as dead code that would race
+ * the DMA chain if anyone ever did call it. */
 el_err_code_t read_bytes_nonblock(char* buffer, size_t size) {
-    out_transport_lock();
-    DEV_UART* console_uart = get_console_uart();
-
-    size_t read{0};
-    size_t pos_of_bytes{0};
-    while (size) {
-        size_t bytes_to_read{size < 8 ? size : 8};
-
-        read += console_uart->uart_read_nonblock(buffer + pos_of_bytes, bytes_to_read);
-
-        pos_of_bytes += bytes_to_read;
-        size -= bytes_to_read;
-
+    size_t got = 0;
+    uint8_t b;
+    while (got < size && out_transport_rx_pop(&b)) {
+        buffer[got++] = (char)b;
     }
-
-    out_transport_unlock();
-    return read > 0 ? EL_OK : EL_AGAIN;
+    return got > 0 ? EL_OK : EL_AGAIN;
 }
 
 
@@ -694,26 +666,82 @@ static inline void put_u16_le(uint8_t* p, uint16_t v) {
     p[0] = (uint8_t)(v); p[1] = (uint8_t)(v >> 8);
 }
 
-void send_audio_binary_frame(const int16_t* pcm, size_t len_bytes, uint32_t sample_rate,
-                              uint8_t channels, uint8_t bits) {
-    out_transport_lock();
+/* Piece size for audio_tx_pump(): each piece is sent via one send_bytes()
+ * call, locking out_transport only for that piece (released between
+ * pieces) - see audio_tx_pump()'s own comment.
+ *
+ * 2026-07-12: tried holding out_transport_lock() for the WHOLE frame
+ * (acquired in audio_tx_begin_frame(), released once the last piece was
+ * sent) to fully close the interleaving race described below. Confirmed on
+ * hardware this fixed CRC corruption completely (0/415 bad) but
+ * effectively starved cam_task's bbox JSON sends (event_count=0 over a
+ * 120s run) - audio_task runs at a strictly higher FreeRTOS priority
+ * (AUDIO_TASK_PRIORITY = configMAX_PRIORITIES-1 vs cam_task's -2, see
+ * sscma_cam_mic.c), so as long as audio_task has any ready work (which is
+ * most of the time - the moment one frame's lock is released,
+ * audio_tx_begin_frame() for the next already-ready PDM chunk re-acquires
+ * it before cam_task, a lower-priority task, can ever get scheduled) it
+ * never actually yields the mutex long enough for cam_task to win it.
+ * Reverted to per-piece release, but with a MUCH bigger piece
+ * (256 -> 2048, an 8x cut in release points per 8018-byte frame) as a
+ * middle ground: still leaves cam_task periodic real windows to send
+ * (unlike whole-frame locking), while cutting the number of chances per
+ * frame for its JSON reply to land mid-piece and corrupt the payload by
+ * ~8x compared to the original 256-byte piecing (which measured 27-40%
+ * CRC-bad frames under concurrent camera+audio load - see
+ * esp32_camera_web_server_bridge memory). Not a full fix, a rebalancing;
+ * re-measure both event_count and crc_bad rate after this change. */
+#define AUDIO_TX_PIECE_BYTES (2048)
+/* header(16) + max PDM chunk payload (pdm_audio.c's CHUNK_BYTES, currently
+ * 8000, capped by its own comment at the driver's <8192 limit) + crc16(2). */
+#define AUDIO_TX_FRAME_MAX (16 + 8192 + 2)
 
-    uint8_t header[16];
-    header[0] = 0xFF; header[1] = 'S'; header[2] = 'M'; header[3] = 'B';
-    put_u32_le(&header[4], sample_rate);
-    put_u32_le(&header[8], (uint32_t)len_bytes);
-    header[12] = channels;
-    header[13] = bits;
-    header[14] = 0;
-    header[15] = 0;
-    send_bytes(reinterpret_cast<const char*>(header), sizeof(header));
-    send_bytes(reinterpret_cast<const char*>(pcm), len_bytes);
+/* CM55M_S_APP_DATA (the plain .bss/.data/.heap/.stack region) is already
+ * packed tight enough that this 8KB+ buffer alone overflows the linker's
+ * ASSERT(__StackLimit >= __HeapLimit) - see pdm_audio.c's own s_audio_buf
+ * for the same reasoning. .bss.NoInit routes it to CM55M_S_SRAM instead
+ * (still ~62KB free there), which is fine since audio_tx_begin_frame()
+ * always fully overwrites it before use - it never relies on zero-init. */
+__attribute__((section(".bss.NoInit")))
+static uint8_t s_audio_tx_buf[AUDIO_TX_FRAME_MAX];
+static size_t s_audio_tx_len = 0; /* total bytes in s_audio_tx_buf for this frame */
+static size_t s_audio_tx_pos = 0; /* bytes already sent */
 
-    uint8_t crc_bytes[2];
-    put_u16_le(crc_bytes, el_crc16_maxim(reinterpret_cast<const uint8_t*>(pcm), len_bytes));
-    send_bytes(reinterpret_cast<const char*>(crc_bytes), sizeof(crc_bytes));
+void audio_tx_begin_frame(const int16_t* pcm, size_t len_bytes, uint32_t sample_rate,
+                           uint8_t channels, uint8_t bits) {
+    size_t total = 16 + len_bytes + 2;
+    if (total > sizeof(s_audio_tx_buf)) {
+        return; /* oversized chunk - shouldn't happen, pdm_audio.c caps at 8000 */
+    }
 
-    out_transport_unlock();
+    uint8_t* p = s_audio_tx_buf;
+    p[0] = 0xFF; p[1] = 'S'; p[2] = 'M'; p[3] = 'B';
+    put_u32_le(&p[4], sample_rate);
+    put_u32_le(&p[8], (uint32_t)len_bytes);
+    p[12] = channels;
+    p[13] = bits;
+    p[14] = 0;
+    p[15] = 0;
+    memcpy(p + 16, pcm, len_bytes);
+    put_u16_le(p + 16 + len_bytes,
+               el_crc16_maxim(reinterpret_cast<const uint8_t*>(pcm), len_bytes));
+
+    s_audio_tx_len = total;
+    s_audio_tx_pos = 0;
+}
+
+bool audio_tx_busy(void) {
+    return s_audio_tx_pos < s_audio_tx_len;
+}
+
+void audio_tx_pump(void) {
+    if (s_audio_tx_pos >= s_audio_tx_len) {
+        return;
+    }
+    size_t remain = s_audio_tx_len - s_audio_tx_pos;
+    size_t piece = remain < AUDIO_TX_PIECE_BYTES ? remain : AUDIO_TX_PIECE_BYTES;
+    send_bytes(reinterpret_cast<const char*>(s_audio_tx_buf + s_audio_tx_pos), piece);
+    s_audio_tx_pos += piece;
 }
 
 
@@ -728,9 +756,20 @@ std::string model_info_2_json_str(el_model_info_t model_info) {
                           std::to_string(model_info.size),
                           "}");
 }
+/* 2026-07-10: prefixes the current command's tag (if any - see
+ * at_cmd_current_tag()'s comment) onto a reply name, per
+ * at-protocol-en_US.md's "Tagging" section. at_cmd.cpp's reply_simple()
+ * does the equivalent for every command routed through it; these four
+ * standalone NAME?/VER?/ID?/INFO? functions build their JSON directly, so
+ * they need their own copy of the same logic. */
+static std::string at_tagged_name(const char* name) {
+    const char* tag = at_cmd_current_tag();
+    return tag[0] ? concat_strings(tag, "@", name) : std::string(name);
+}
+
 void send_name_reply() {
     const auto& ss{concat_strings("\r{\"type\": 0, \"name\": \"",
-                                  "NAME?",
+                                  at_tagged_name("NAME?").c_str(),
                                   "\", \"code\": ",
                                   std::to_string(EL_OK),
                                   ", \"data\": ",
@@ -741,7 +780,7 @@ void send_name_reply() {
 
 void send_ver_reply() {
     const auto& ss{concat_strings("\r{\"type\": 0, \"name\": \"",
-                                  "VER?",
+                                  at_tagged_name("VER?").c_str(),
                                   "\", \"code\": ",
                                   std::to_string(EL_OK),
                                   ", \"data\": {\"software\": \"",
@@ -754,7 +793,7 @@ void send_ver_reply() {
 
 void send_id_reply() {
     const auto& ss{concat_strings("\r{\"type\": 0, \"name\": \"",
-                                  "ID?",
+                                  at_tagged_name("ID?").c_str(),
                                   "\", \"code\": ",
                                   std::to_string(EL_OK),
                                   ", \"data\": ",
@@ -790,7 +829,7 @@ void send_info_reply() {
 
     const auto& ss{
      concat_strings("\r{\"type\": 0, \"name\": \"",
-                    "INFO?",
+                    at_tagged_name("INFO?").c_str(),
                     "\", \"code\": ",
                     std::to_string(EL_OK),
                     ", \"data\": {\"crc16_maxim\": ",

@@ -168,7 +168,6 @@ template <typename... Args> constexpr inline decltype(auto) concat_strings(Args&
 
 
 el_err_code_t send_bytes(const char* buffer, size_t size) ;
-el_err_code_t read_bytes(char* buffer, size_t size);
 el_err_code_t read_bytes_nonblock(char* buffer, size_t size);
 void el_base64_encode(const unsigned char* in, int in_len, char* out);
 void event_reply(const std::string& data);
@@ -183,9 +182,23 @@ void event_reply_named_with_payload(const char* name, const std::string& prefix_
  * ~33%+ size tax ate the entire inter-chunk time budget at 32kHz on the
  * 921600-baud UART, so the PDM ring wrapped under the reader). Magic's first
  * byte is 0xFF, not ASCII, so it can't collide with a coincidental "ASMB"
- * inside a concurrent base64-encoded image payload - see send_result.cpp. */
-void send_audio_binary_frame(const int16_t* pcm, size_t len_bytes, uint32_t sample_rate,
-                              uint8_t channels, uint8_t bits);
+ * inside a concurrent base64-encoded image payload - see send_result.cpp.
+ *
+ * 2026-07-10: split from one atomic send_audio_binary_frame() call into
+ * begin/pump so at_cmd_poll() can drip a chunk out over many ~5ms polls
+ * instead of one ~87ms blocking send_bytes() burst (8018 bytes at 921600
+ * baud) held under out_transport_lock() - see send_result.cpp for the
+ * hardware symptom that motivated this. */
+void audio_tx_begin_frame(const int16_t* pcm, size_t len_bytes, uint32_t sample_rate,
+                           uint8_t channels, uint8_t bits);
+/* True while a frame started by audio_tx_begin_frame() still has bytes left
+ * to send. at_cmd_poll() must not start a new frame, and must not dispatch
+ * a newly-completed AT command line, while this is true - either would
+ * splice foreign bytes into the middle of the framed payload on the wire. */
+bool audio_tx_busy(void);
+/* Sends one small piece (see AUDIO_TX_PIECE_BYTES in send_result.cpp) of the
+ * frame started by audio_tx_begin_frame(). No-op if not busy. */
+void audio_tx_pump(void);
 /* Each sends exactly one Operation Response for its own query, per the AT
  * protocol (at-protocol-en_US.md) - replaces the old send_device_id(), which
  * blasted all four back-to-back regardless of which one was actually asked

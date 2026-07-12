@@ -24,13 +24,22 @@ extern "C" {
 #include "at_cmd.h"
 
 #define LINE_BUF_SIZE (96)
+#define TAG_BUF_SIZE  (24)
 
 static char     s_line[LINE_BUF_SIZE];
 static size_t   s_line_len = 0;
 
+/* 2026-07-10: current command's tag (AT+<Tag>@<Body>, at-protocol-en_US.md's
+ * "Tagging" section) - see at_cmd.h's comment for why this exists. Reset at
+ * the top of every process_line() call; "" when the line had no tag. */
+static char     s_cur_tag[TAG_BUF_SIZE] = "";
+
+const char* at_cmd_current_tag(void) { return s_cur_tag; }
+
 static void reply_simple(const char* name, el_err_code_t code, const std::string& data)
 {
-    const auto& ss = concat_strings("\r{\"type\": 0, \"name\": \"", name,
+    const std::string& tagged = s_cur_tag[0] ? concat_strings(s_cur_tag, "@", name) : std::string(name);
+    const auto& ss = concat_strings("\r{\"type\": 0, \"name\": \"", tagged.c_str(),
                                      "\", \"code\": ", std::to_string((int)code),
                                      ", \"data\": ", data, "}\n");
     send_bytes(ss.c_str(), ss.size());
@@ -269,6 +278,32 @@ static void process_line(char* line)
     }
     char* name = line + 3;
 
+    /* Tag support (AT+<Tag>@<Body>, at-protocol-en_US.md's "Tagging"
+     * section) - see at_cmd.h's at_cmd_current_tag() comment for why this
+     * matters (the ESP32C3 camera_web_server bridge tags every command it
+     * relays and needs the tag echoed back to correlate replies). The '@'
+     * only counts as a tag delimiter if it appears before both '='/'?' - a
+     * command's own name never legitimately contains '@', but a quoted
+     * argument value theoretically could (e.g. AT+INFO="foo@bar"), and that
+     * must not be mistaken for a tag. */
+    s_cur_tag[0] = '\0';
+    {
+        char* at = strchr(name, '@');
+        char* eq_probe = strchr(name, '=');
+        char* q_probe  = strchr(name, '?');
+        if (at != nullptr && (eq_probe == nullptr || at < eq_probe) && (q_probe == nullptr || at < q_probe)) {
+            size_t tag_len = (size_t)(at - name);
+            if (tag_len < sizeof(s_cur_tag)) {
+                memcpy(s_cur_tag, name, tag_len);
+                s_cur_tag[tag_len] = '\0';
+                name = at + 1;
+            }
+            /* else: tag too long for the scratch buffer - fall through and
+             * treat the whole "<tag>@<body>" run as one (unrecognized)
+             * command name, same as if no tag delimiter had been found. */
+        }
+    }
+
     char* eq = strchr(name, '=');
     char* q  = strchr(name, '?');
     bool is_query = false;
@@ -362,6 +397,16 @@ void at_cmd_poll(void)
         if (c == '\r' || c == '\n') {
             if (s_line_len > 0) {
                 s_line[s_line_len] = '\0';
+                /* An audio frame's bytes are being drip-fed across many polls
+                 * by audio_tx_pump() (see below) - dispatching a command here
+                 * mid-frame would send its reply via send_bytes() in between
+                 * two pieces, splicing foreign bytes into the middle of the
+                 * framed payload on the wire. Drain the rest of the current
+                 * frame first; it's at most a few hundred us worth of pieces
+                 * away from done. */
+                while (audio_tx_busy()) {
+                    audio_tx_pump();
+                }
                 process_line(s_line);
                 s_line_len = 0;
             }
@@ -377,21 +422,29 @@ void at_cmd_poll(void)
     } else if (s_line_len > 0 && ++s_idle_polls >= LINE_IDLE_FLUSH_POLLS) {
         s_line[s_line_len] = '\0';
         xprintf("at_cmd: idle-flushing pending line (lost terminator?): '%s'\r\n", s_line);
+        while (audio_tx_busy()) {
+            audio_tx_pump();
+        }
         process_line(s_line);
         s_line_len = 0;
         s_idle_polls = 0;
     }
 
-    if (app_get_audio_streaming()) {
+    /* Drip the current audio frame (if any) out a small piece at a time
+     * rather than blocking this whole poll on one ~87ms send_bytes() burst -
+     * see audio_tx_begin_frame()'s comment in send_result.h. Only start a
+     * *new* frame once the previous one has fully drained (audio_tx_busy()
+     * false); audio_tx keeps draining even after AT+BREAK clears
+     * app_get_audio_streaming(), so a frame already in flight always finishes
+     * intact instead of being cut off mid-payload. */
+    if (audio_tx_busy()) {
+        audio_tx_pump();
+    } else if (app_get_audio_streaming()) {
         uint32_t len = 0;
         const int16_t* chunk = pdm_audio_poll_chunk(&len);
         if (chunk != nullptr) {
-            /* Binary framing (no JSON/base64) - see send_audio_binary_frame()'s
-             * comment in send_result.cpp. Needed at 32kHz: base64+JSON's size
-             * tax left almost no margin against the 921600-baud UART, so the
-             * PDM ring wrapped under the reader (confirmed via
-             * pdm_audio_debug_log()'s growing backlog). */
-            send_audio_binary_frame(chunk, len, pdm_audio_get_rate(), 1, 16);
+            audio_tx_begin_frame(chunk, len, pdm_audio_get_rate(), 1, 16);
+            audio_tx_pump();
         }
     }
 }

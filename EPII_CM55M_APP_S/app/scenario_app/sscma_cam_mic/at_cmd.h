@@ -22,6 +22,18 @@ void at_cmd_init(void);
  * tick; non-blocking. */
 void at_cmd_poll(void);
 
+/* 2026-07-10: tag support (AT+<Tag>@<Body> - at-protocol-en_US.md's
+ * "Tagging" section), added specifically so the ESP32C3 camera_web_server
+ * bridge's command_handler() (which tags every command it relays, e.g.
+ * "AT+HTTPD1a2b3c4d@SENSOR=1,1,2") can correlate replies to requests -
+ * before this, every tagged command fell through to "unsupported command"
+ * because the whole "<tag>@<name>" string never matched any known command
+ * name. Returns "" (never NULL) when the command currently being processed
+ * had no tag. Only valid to call while a reply to that command is being
+ * built (i.e. from inside a command handler or a send_*_reply() function
+ * called from one) - the value is scratch, reset per line. */
+const char *at_cmd_current_tag(void);
+
 #ifdef __cplusplus
 }
 #endif

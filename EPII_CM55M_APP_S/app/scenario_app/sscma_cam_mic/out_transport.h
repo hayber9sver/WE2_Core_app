@@ -18,6 +18,7 @@
 #ifndef APP_SCENARIO_SSCMA_CAM_MIC_OUT_TRANSPORT_H_
 #define APP_SCENARIO_SSCMA_CAM_MIC_OUT_TRANSPORT_H_
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -42,6 +43,16 @@ out_transport_e out_transport_get(void);
  * instead of a hardcoded CONSOLE_UART_ID when opening/reading/writing the
  * console UART. */
 int out_transport_uart_id(void);
+
+/* 2026-07-11: pops one byte (if available) from the interrupt/DMA-fed ring
+ * buffer for whichever UART out_transport_uart_id() currently reports -
+ * read_bytes_nonblock() (send_result.cpp) uses this instead of touching the
+ * DW_UART driver directly, so incoming bytes get picked up the instant they
+ * land rather than whenever a task next happens to poll (see out_transport.c's
+ * own comment for why that distinction matters: the RX hardware FIFO is only
+ * 16 bytes, and overflows well before any task polling interval could
+ * reliably catch it). Returns false if nothing is buffered. */
+bool out_transport_rx_pop(uint8_t *out_byte);
 
 /* cam_task and audio_task both end up touching whichever UART peripheral is
  * currently active (send_bytes()/read_bytes*() from send_result.cpp, and the
