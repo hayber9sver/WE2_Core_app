@@ -690,8 +690,25 @@ static inline void put_u16_le(uint8_t* p, uint16_t v) {
  * ~8x compared to the original 256-byte piecing (which measured 27-40%
  * CRC-bad frames under concurrent camera+audio load - see
  * esp32_camera_web_server_bridge memory). Not a full fix, a rebalancing;
- * re-measure both event_count and crc_bad rate after this change. */
-#define AUDIO_TX_PIECE_BYTES (2048)
+ * re-measure both event_count and crc_bad rate after this change.
+ *
+ * 2026-07-12 (later): bumped 2048 -> 4096 to address a DIFFERENT,
+ * 32kHz-specific symptom found afterward: pdm_audio.c's upstream ring
+ * (NUM_BUFF=4 chunks) only buffers ~500ms of audio at 32kHz (vs ~1000ms at
+ * 16kHz, since chunks are produced twice as often at the same fixed
+ * CHUNK_SAMPLES) - any transmission stall long enough to eat that 500ms
+ * margin (e.g. from bbox JSON winning the lock in a piece-boundary gap)
+ * overflows it and silently drops chunks, measured on hardware as ~25%
+ * audio loss at 32kHz+concurrent bbox vs <3% at 16kHz in the same
+ * conditions. Raw bandwidth math says 32kHz audio alone only needs ~70% of
+ * the 921600 baud link and bbox JSON is under 1% - the loss looks like
+ * contention-induced stalls eating the ring's time margin, not a genuine
+ * bandwidth ceiling, so halving the piece count (4 -> 2 per 8018-byte
+ * frame) to halve the number of interleaving opportunities is a reasonable
+ * next lever. Cost: worst-case AT-reply latency roughly doubles again
+ * (~22ms -> ~44ms per piece), still far under the whole-frame-lock
+ * version's ~87ms that starved cam_task entirely. */
+#define AUDIO_TX_PIECE_BYTES (4096)
 /* header(16) + max PDM chunk payload (pdm_audio.c's CHUNK_BYTES, currently
  * 8000, capped by its own comment at the driver's <8192 limit) + crc16(2). */
 #define AUDIO_TX_FRAME_MAX (16 + 8192 + 2)
