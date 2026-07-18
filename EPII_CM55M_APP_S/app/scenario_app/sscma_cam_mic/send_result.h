@@ -194,11 +194,22 @@ void audio_tx_begin_frame(const int16_t* pcm, size_t len_bytes, uint32_t sample_
 /* True while a frame started by audio_tx_begin_frame() still has bytes left
  * to send. at_cmd_poll() must not start a new frame, and must not dispatch
  * a newly-completed AT command line, while this is true - either would
- * splice foreign bytes into the middle of the framed payload on the wire. */
+ * splice foreign bytes into the middle of the framed payload on the wire.
+ *
+ * 2026-07-17: extern "C" added specifically so i2c_cmd.c (a plain .c file,
+ * doesn't include this C++-oriented header at all) can declare and call
+ * these two with a matching, non-name-mangled symbol - its own I2C command
+ * dispatch path needed the exact same audio_tx_busy()-drain-before-dispatch
+ * guard at_cmd_poll() already had, and skipping it was the root cause of an
+ * intermittent "command sent, WE2 replied, ESP32 never sees a valid reply"
+ * bug during active audio streaming (see i2c_cmd.c's own comment at its
+ * call site for the full story). */
+extern "C" {
 bool audio_tx_busy(void);
 /* Sends one small piece (see AUDIO_TX_PIECE_BYTES in send_result.cpp) of the
  * frame started by audio_tx_begin_frame(). No-op if not busy. */
 void audio_tx_pump(void);
+}
 /* Each sends exactly one Operation Response for its own query, per the AT
  * protocol (at-protocol-en_US.md) - replaces the old send_device_id(), which
  * blasted all four back-to-back regardless of which one was actually asked

@@ -34,6 +34,14 @@ void at_cmd_poll(void);
  * called from one) - the value is scratch, reset per line. */
 const char *at_cmd_current_tag(void);
 
+/* 2026-07-16: shared dispatch entry point for command bytes that arrive
+ * from somewhere other than the UART line-accumulation loop in
+ * at_cmd_poll() - added for i2c_cmd.c's I2C command channel. `line` must
+ * already be a NUL-terminated, mutable buffer with no trailing '\r'/'\n'
+ * (same contract at_cmd_poll() gives process_line() internally) - the
+ * parser tokenizes it in place. */
+void at_cmd_process_line(char *line);
+
 #ifdef __cplusplus
 }
 #endif

@@ -358,6 +358,11 @@ static void process_line(char* line)
     }
 }
 
+void at_cmd_process_line(char *line)
+{
+    process_line(line);
+}
+
 /* at_cmd_poll() runs roughly every 5ms (see audio_task's vTaskDelay). Under
  * heavy camera+NPU load a received byte can occasionally go missing (seen on
  * hardware: a command's trailing \r vanished, so the parser sat waiting

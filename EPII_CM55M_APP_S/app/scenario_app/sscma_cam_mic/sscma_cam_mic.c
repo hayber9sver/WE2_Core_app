@@ -76,6 +76,7 @@
 #include "pdm_audio.h"
 #include "at_cmd.h"
 #include "out_transport.h"
+#include "i2c_cmd.h"
 
 #define CAM_TASK_PRIORITY    (configMAX_PRIORITIES - 2)
 #define AUDIO_TASK_PRIORITY  (configMAX_PRIORITIES - 1)
@@ -304,6 +305,7 @@ static void audio_task(void *pvParameters)
     {
         at_cmd_poll();
         out_transport_poll();
+        i2c_cmd_poll();
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
@@ -374,6 +376,7 @@ int sscma_cam_mic_app(void)
 
     out_transport_init();
     at_cmd_init();
+    i2c_cmd_init();
 
     if (xTaskCreate(cam_task, "cam_task", CAM_TASK_STACK_WORDS, NULL, CAM_TASK_PRIORITY, NULL) != pdPASS)
     {
