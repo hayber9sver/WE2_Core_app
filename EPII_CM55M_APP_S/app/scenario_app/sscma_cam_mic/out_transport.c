@@ -1,9 +1,27 @@
 /*
  * out_transport.c
  *
- * See out_transport.h. The probe/timeout periods are counted in idle-loop
- * poll calls rather than wall-clock time (no extra timer dependency), so
- * they are a rough heuristic, not a precise duration.
+ * See out_transport.h. The probe period is counted in idle-loop poll calls
+ * rather than wall-clock time (no extra timer dependency), so it's a rough
+ * heuristic, not a precise duration.
+ *
+ * 2026-07-19: the echo check used to be gated to a short window after each
+ * probe write (a "pending" flag with its own timeout), on the theory that
+ * an echo arriving outside that window must belong to some earlier, already-
+ * abandoned probe. Hardware-verified that's the wrong model: the peer (an
+ * ESP32C3 bridge) can legitimately take several seconds to get around to
+ * echoing if its own main loop is busy with WiFi/httpd/I2C at that instant,
+ * and every echo landing just after the window closed cost a full
+ * PROBE_PERIOD_POLLS wait before the next attempt - compounding under
+ * sustained load into what looked like a permanently stuck handshake.
+ * Fixed by decoupling the two: the RX ring is checked for the marker byte
+ * on *every* poll unconditionally (cheap - a non-blocking ring-buffer pop,
+ * already interrupt/DMA-fed, not a hardware register wait), regardless of
+ * how long ago (or whether) a probe was last sent; a fresh probe still goes
+ * out every PROBE_PERIOD_POLLS purely as a hedge against the *original*
+ * probe byte itself getting lost (line noise, peer not listening yet).
+ * Any echo byte at all is accepted as proof the peer is alive and looped
+ * it back, whichever probe it was actually replying to.
  */
 
 #include <stdbool.h>
@@ -29,16 +47,13 @@
  * "rough heuristic" per this file's own header comment, just a much more
  * usable one. */
 #define PROBE_PERIOD_POLLS   (1000u)
-#define PROBE_TIMEOUT_POLLS  (400u)
 
 static out_transport_e s_transport      = OUT_TRANSPORT_USB;
 static DEV_UART        *s_uart0         = NULL;
 static DEV_UART        *s_uart1         = NULL;
 static bool             s_uart1_ready   = false;
-static bool             s_probe_pending = false;
 static uint32_t         s_poll_count    = 0;
 static uint32_t         s_next_probe_at = PROBE_PERIOD_POLLS;
-static uint32_t         s_probe_deadline = 0;
 
 /* 2026-07-11: interrupt/DMA-driven RX, replacing what used to be a plain
  * poll of uart_read_nonblock() from audio_task's own loop (at_cmd_poll() in
@@ -269,31 +284,37 @@ void out_transport_poll(void)
 
     out_transport_lock();
 
-    if (s_probe_pending) {
-        uint8_t c;
-        /* Always UART1's own ring here, not out_transport_rx_pop() (which
-         * follows s_transport - still USB/UART0 at this point, since
-         * detecting whether to switch is exactly what this block does). */
-        if (rx_ring_pop(&s_rx_ring[1], &c) && c == PROBE_MARKER_BYTE) {
+    /* Unconditional, every poll - no "pending window" to miss. Cheap: a
+     * non-blocking ring-buffer pop already fed by the UART1 RX DMA/ISR
+     * chain, not a hardware wait. Always UART1's own ring here, not
+     * out_transport_rx_pop() (which follows s_transport - still USB/UART0
+     * at this point, since detecting whether to switch is exactly what
+     * this block does). */
+    uint8_t c;
+    if (rx_ring_pop(&s_rx_ring[1], &c)) {
+        if (c == PROBE_MARKER_BYTE) {
             s_transport = OUT_TRANSPORT_UART1;
-            s_probe_pending = false;
             out_transport_unlock();
             xprintf("out_transport: UART1 echo detected, switching output to UART1\r\n");
             return;
         }
-        if (s_poll_count >= s_probe_deadline) {
-            s_probe_pending = false; /* no echo within the window, try again later */
-        }
-        out_transport_unlock();
-        return;
+        // 2026-07-19: temporary diagnostic - distinguishes "ESP32->WE2 RX
+        // wiring/pins are dead, nothing ever arrives" from "something
+        // arrives but isn't recognized as the marker byte" (wrong baud,
+        // noise, wrong wire). Remove once the handshake is confirmed
+        // reliable on real hardware.
+        xprintf("out_transport: UART1 RX got byte 0x%02X (not the 0x%02X marker)\r\n",
+                (unsigned)c, (unsigned)PROBE_MARKER_BYTE);
     }
 
+    /* Fresh probe every ~5s regardless of any earlier one's fate - purely a
+     * hedge against the probe byte itself getting lost; the echo check
+     * above never stops looking, so this never needs to "wait" for
+     * anything. */
     if (s_poll_count >= s_next_probe_at) {
         char b = (char)PROBE_MARKER_BYTE;
         int32_t written = s_uart1->uart_write(&b, 1);
         xprintf("out_transport: probe write on UART1, ret=%ld\r\n", (long)written);
-        s_probe_pending = true;
-        s_probe_deadline = s_poll_count + PROBE_TIMEOUT_POLLS;
         s_next_probe_at = s_poll_count + PROBE_PERIOD_POLLS;
     }
 
