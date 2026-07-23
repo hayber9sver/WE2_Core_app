@@ -196,6 +196,24 @@ static void cmd_tiou(const char* args, bool is_query)
     reply_simple("TIOU", EL_OK, std::to_string(app_get_tiou()));
 }
 
+/* AI-input-only rotation (0/90/180/270 deg) - see sscma_cam_mic.h's
+ * app_set_ai_rotate() comment for why this doesn't touch the JPEG preview
+ * or need a datapath reinit (unlike AT+SENSOR). */
+static void cmd_rotate(const char* args, bool is_query)
+{
+    if (is_query) {
+        reply_simple("ROTATE?", EL_OK, std::to_string(app_get_ai_rotate()));
+        return;
+    }
+    long v = strtol(args, nullptr, 10);
+    if (v < 0 || v > 3) {
+        reply_simple("ROTATE", EL_EINVAL, "\"value must be 0 (0deg), 1 (90deg), 2 (180deg), or 3 (270deg)\"");
+        return;
+    }
+    app_set_ai_rotate((uint8_t)v);
+    reply_simple("ROTATE", EL_OK, std::to_string(app_get_ai_rotate()));
+}
+
 /* RGB640x480_* (not YUV640x480_*): the YOLO detect model needs a 3-channel
  * RGB raw buffer, not the grayscale-Y-plane-only YUV420 the old person-
  * detect model used - see cisdp_sensor.c's demosbuf sizing. */
@@ -264,6 +282,7 @@ static void cmd_help()
         "  AT+TIOU=<0..100>/AT+TIOU?                 NMS IoU threshold\n"
         "  AT+SENSOR=<id,enable,opt_id>/AT+SENSOR?   set/query camera resolution\n"
         "  AT+SENSORS?                               list available camera resolutions\n"
+        "  AT+ROTATE=<0..3>/AT+ROTATE?                rotate AI input 0/90/180/270deg (preview unaffected)\n"
         "  AT+STAT?                                  boot count / ready state\n"
         "  AT+ID?/AT+NAME?/AT+VER?/AT+INFO?          device identity\n"
         "  AT+RST                                    reboot\n"
@@ -338,6 +357,8 @@ static void process_line(char* line)
     } else if (strcmp(name, "SENSOR") == 0) {
         if (is_query) cmd_sensor_query();
         else cmd_sensor(args);
+    } else if (strcmp(name, "ROTATE") == 0) {
+        cmd_rotate(args, is_query);
     } else if (strcmp(name, "STAT") == 0) {
         if (is_query) cmd_stat_query();
         else reply_simple("STAT", EL_ENOTSUP, "\"read-only\"");
@@ -356,11 +377,6 @@ static void process_line(char* line)
     } else {
         reply_simple(name, EL_EINVAL, "\"unsupported command\"");
     }
-}
-
-void at_cmd_process_line(char *line)
-{
-    process_line(line);
 }
 
 /* at_cmd_poll() runs roughly every 5ms (see audio_task's vTaskDelay). Under

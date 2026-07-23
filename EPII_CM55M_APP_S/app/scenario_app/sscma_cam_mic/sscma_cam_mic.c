@@ -9,8 +9,8 @@
  * they just both need to be able to run concurrently. cam_task's body is
  * the same hxevent + XDMA-frame-ready pattern allon_sensor_tflm uses
  * (hx_eventloop_start() blocks forever dispatching camera events);
- * audio_task polls incoming AT commands, drains ready PCM chunks, and
- * drives the UART1 echo probe. FreeRTOS's preemptive scheduler (SysTick-
+ * audio_task polls incoming AT commands and drains ready PCM chunks.
+ * FreeRTOS's preemptive scheduler (SysTick-
  * driven) is what actually lets audio_task run while cam_task is parked
  * in its blocking event loop - this repo doesn't have a prior example of
  * hxevent running under FreeRTOS (the one FreeRTOS camera app in this SDK,
@@ -76,7 +76,6 @@
 #include "pdm_audio.h"
 #include "at_cmd.h"
 #include "out_transport.h"
-#include "i2c_cmd.h"
 
 #define CAM_TASK_PRIORITY    (configMAX_PRIORITIES - 2)
 #define AUDIO_TASK_PRIORITY  (configMAX_PRIORITIES - 1)
@@ -107,6 +106,10 @@ static uint8_t  g_tscore = 25;
  * threshold_nms_(0.45)) - now runtime-adjustable via AT+TIOU. */
 static uint8_t  g_tiou = 45;
 
+/* 0..3 = 0/90/180/270 deg, AI-input-only rotation (AT+ROTATE) - see
+ * sscma_cam_mic.h's comment. */
+static uint8_t  g_ai_rotate = 0;
+
 static uint32_t g_boot_count = 0;
 
 /* -1 = no resolution change pending; otherwise an APP_DP_INP_SUBSAMPLE_E
@@ -125,6 +128,8 @@ void app_set_tscore(uint8_t score) { g_tscore = score; }
 uint8_t app_get_tscore(void) { return g_tscore; }
 void app_set_tiou(uint8_t iou) { g_tiou = iou; }
 uint8_t app_get_tiou(void) { return g_tiou; }
+void app_set_ai_rotate(uint8_t rot) { g_ai_rotate = rot; }
+uint8_t app_get_ai_rotate(void) { return g_ai_rotate; }
 uint32_t app_get_boot_count(void) { return g_boot_count; }
 
 void app_request_cam_resolution(int subs)
@@ -281,22 +286,19 @@ static void cam_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
-/* audio_task body: AT-command parsing, audio-chunk draining and the UART1
- * echo probe all live here, independent of whatever cam_task is doing.
+/* audio_task body: AT-command parsing and audio-chunk draining live here,
+ * independent of whatever cam_task is doing.
  *
- * 2026-07-11: was vTaskDelay(pdMS_TO_TICKS(5)) - confirmed on hardware that
- * a multi-byte AT command arriving from the ESP32C3 UART1 bridge can get
- * silently truncated: WE2's UART1 RX is a bare 16-byte hardware FIFO
- * (out_transport.c/send_result.cpp poll it directly, no interrupt/DMA
- * draining), and at 921600 baud that FIFO fills in ~173us - far faster than
- * this task was coming back around to drain it. Dropping to 1ms (the
- * shortest step FreeRTOS's 1000Hz tick can express via vTaskDelay) cuts
- * that exposure roughly 5x. This is a mitigation, not a fix: 1ms is still
- * ~6x longer than the 173us fill time, so a burst that lands entirely
- * inside one gap can still overrun - a hard guarantee needs interrupt- or
- * DMA-driven RX instead of polling. Paired with shrinking the ESP32 bridge's
- * per-command tag (app_httpd.cpp's CMD_TAG_FMT_STR) so most short commands
- * fit under 16 bytes in the first place. */
+ * 2026-07-11: was vTaskDelay(pdMS_TO_TICKS(5)), dropped to 1ms (the shortest
+ * step FreeRTOS's 1000Hz tick can express via vTaskDelay) - originally a
+ * mitigation for WE2's UART RX being a bare 16-byte hardware FIFO (fills in
+ * ~173us at 921600 baud, faster than a 5ms task-polling loop could
+ * reliably drain). RX has since moved to interrupt/DMA (out_transport.c -
+ * a completion ISR re-arms a 1-byte read the instant each byte lands, so
+ * the hardware FIFO is never the bottleneck anymore); this task's own 1ms
+ * cadence just governs how promptly at_cmd_poll() drains that DMA-fed ring
+ * and dispatches a completed line, independent of the RX-loss concern this
+ * comment originally described. */
 static void audio_task(void *pvParameters)
 {
     (void)pvParameters;
@@ -304,8 +306,6 @@ static void audio_task(void *pvParameters)
     for (;;)
     {
         at_cmd_poll();
-        out_transport_poll();
-        i2c_cmd_poll();
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
@@ -376,7 +376,6 @@ int sscma_cam_mic_app(void)
 
     out_transport_init();
     at_cmd_init();
-    i2c_cmd_init();
 
     if (xTaskCreate(cam_task, "cam_task", CAM_TASK_STACK_WORDS, NULL, CAM_TASK_PRIORITY, NULL) != pdPASS)
     {

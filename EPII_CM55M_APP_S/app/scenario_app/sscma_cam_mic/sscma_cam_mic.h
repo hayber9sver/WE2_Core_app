@@ -15,6 +15,7 @@
  *   - AT+TIOU=<0..100>/AT+TIOU?           NMS IoU threshold
  *   - AT+SENSOR=<id,en,opt>/AT+SENSOR?    set/query camera resolution
  *   - AT+SENSORS?                         list available camera resolutions
+ *   - AT+ROTATE=<0..3>/AT+ROTATE?         rotate AI input 0/90/180/270 deg (preview JPEG unaffected)
  *   - AT+STAT?                            boot count / ready state
  *   - AT+ID?/AT+NAME?/AT+VER?/AT+INFO?    device identity
  *   - AT+RST                              reboot
@@ -77,6 +78,15 @@ uint8_t app_get_tiou(void);
  * than incrementing; left as-is rather than adding flash-backed persistence
  * (and its per-boot wear cost) per explicit direction. */
 uint32_t app_get_boot_count(void);
+
+/* 0..3, AI-input rotation in 90-degree steps (AT+ROTATE): 0=0,1=90,2=180,
+ * 3=270. Applied only to the buffer fed into the YOLO model (cvapp.cpp's
+ * run_yolo_detect()) - the JPEG preview/sample stream is never rotated, so
+ * reported box coordinates are translated back to the unrotated frame
+ * before being sent out. Plain runtime variable, no camera/datapath
+ * reinit needed (unlike AT+SENSOR). */
+void app_set_ai_rotate(uint8_t rot_0_3);
+uint8_t app_get_ai_rotate(void);
 
 /* Requests cam_task switch the camera datapath to a different resolution at
  * runtime (`subs` is an APP_DP_INP_SUBSAMPLE_E value from cisdp_cfg.h - kept

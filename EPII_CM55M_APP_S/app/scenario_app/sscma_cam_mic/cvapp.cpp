@@ -64,10 +64,23 @@
  * also statically carries the RGB raw buffer (640x480x3 = 921600B) and the
  * PDM audio ring (32000B) that tflm_yolov8_od doesn't - 1053KB together with
  * those overflowed CM55M_S_SRAM by ~191KB at link time (confirmed on a real
- * build). Trimmed to fit with ~60KB of headroom; if AllocateTensors() fails
- * once the real model is flashed (arena too small), this is the first knob
- * to raise back up - see the SRAM budget math in this app's README. */
-#define TENSOR_ARENA_BUFSIZE  (800*1024)
+ * build). Originally trimmed to 800KB (~60KB headroom) without ever
+ * measuring what the model actually needed.
+ *
+ * 2026-07-24: AT+ROTATE's rotate scratch buffer (MODEL_INPUT_W*H*C =
+ * 192*192*3 = 108KB, see run_yolo_detect()) didn't fit in that ~60KB
+ * headroom, which finally forced measuring the real number instead of
+ * guessing: cv_init()'s "tflite arena used: X / Y bytes" boot print
+ * (right after AllocateTensors() succeeds) read back 266692 bytes on real
+ * hardware - the 800KB(/672KB, tried first) figure had ~2-3x more slack
+ * than this model has ever needed. Set to 320KB here, ~60KB above the
+ * measured 266692B (matching this same file's original headroom
+ * philosophy, just against the arena's own real usage instead of a guess).
+ * If a future model needs more, AllocateTensors() failing is silent from
+ * cv_init()'s perspective (its "return false" isn't caught by
+ * sscma_cam_mic.c's "< 0" check - a pre-existing bug, not touched here) -
+ * absence of the boot print is the tell; raise this back up and recheck. */
+#define TENSOR_ARENA_BUFSIZE  (320*1024)
 __attribute__(( section(".bss.NoInit"))) uint8_t tensor_arena_buf[TENSOR_ARENA_BUFSIZE] __ALIGNED(32);
 
 using namespace std;
@@ -205,6 +218,8 @@ int cv_init(bool security_enable, bool privilege_enable)
 	if(static_interpreter.AllocateTensors()!= kTfLiteOk) {
 		return false;
 	}
+	xprintf("tflite arena used: %u / %d bytes\n",
+	        (unsigned)static_interpreter.arena_used_bytes(), tensor_arena_size);
 	int_ptr = &static_interpreter;
 	input = static_interpreter.input(0);
 	output = static_interpreter.output(0);
@@ -504,6 +519,79 @@ int run_nms(const yolo_box* boxes, int n, int* keep_out)
     return n_keep;
 }
 
+/* AT+ROTATE support: boxes[] out of decode_boxes() are in the (possibly
+ * rotated, see run_yolo_detect()'s resize/rotate step) 192x192 model-input
+ * space. Since the JPEG preview is never rotated, translate each box back
+ * to the *unrotated* 192x192 space here, before run_yolo_detect()'s
+ * existing scale_x/scale_y step maps it to wire-space - otherwise reported
+ * boxes would land in the wrong place relative to the (unrotated) preview
+ * image. x/y are top-left corners (see decode_boxes()). Only valid because
+ * MODEL_INPUT_W == MODEL_INPUT_H (square), so a 90/270 swap never changes
+ * the canvas size. rot==1/rot==3's direction matches rotate_rgb_90_steps()
+ * exactly - both were derived from, and cross-checked against, the same
+ * physical-rotation reasoning (see that function's comment). */
+static void unrotate_box_inplace(yolo_box &b, uint8_t rot)
+{
+    constexpr float SZ = (float)MODEL_INPUT_W;
+    if (rot == 0) return;
+    float x = b.x, y = b.y, w = b.w, h = b.h;
+    if (rot == 1) {         /* input was rotated 90 deg before inference */
+        b.x = y;
+        b.y = SZ - x - w;
+        b.w = h;
+        b.h = w;
+    } else if (rot == 2) {  /* 180 */
+        b.x = SZ - x - w;
+        b.y = SZ - y - h;
+    } else {                /* rot == 3, 270 */
+        b.x = SZ - y - h;
+        b.y = x;
+        b.w = h;
+        b.h = w;
+    }
+}
+
+/* 2026-07-24: replaces hx_lib_rotate_image() - hardware-confirmed (via a
+ * since-removed temporary AT+ROTDBG? debug dump) to tile the 192x192
+ * frame into a 3x3 grid of shrunk repeats instead of rotating it, and
+ * ships with no source and no working reference call anywhere on this
+ * machine (searched two separate Himax SDK checkouts) to debug further.
+ * A plain index-remap loop is exact, has zero dependencies, and is cheap
+ * enough not to need acceleration: O(size^2) pixel moves (192*192=36864
+ * for this app), memory-bandwidth-bound, not compute-bound - a Cortex-M55
+ * handles this in well under a millisecond, negligible next to a camera
+ * frame's multi-ms budget.
+ *
+ * `steps` is 1/2/3 for 90/180/270 degrees clockwise. Formulas ground-
+ * truthed against unrotate_box_inplace() below (which was already correct
+ * and is unchanged) by deriving both from the same physical-rotation
+ * reasoning: a 90 CW rotation moves the original top-left corner to the
+ * new top-right, etc. - see this commit's own derivation notes if the
+ * formulas ever need re-checking. */
+static void rotate_rgb_90_steps(const uint8_t *src, uint8_t *dst, int size, int channels, int steps)
+{
+    for (int y = 0; y < size; ++y) {
+        for (int x = 0; x < size; ++x) {
+            int sx, sy;
+            if (steps == 1) {         /* 90 */
+                sx = y;
+                sy = size - 1 - x;
+            } else if (steps == 2) {  /* 180 */
+                sx = size - 1 - x;
+                sy = size - 1 - y;
+            } else {                  /* 270 */
+                sx = size - 1 - y;
+                sy = x;
+            }
+            const uint8_t *s = src + ((size_t)sy * size + sx) * channels;
+            uint8_t *d = dst + ((size_t)y * size + x) * channels;
+            for (int c = 0; c < channels; ++c) {
+                d[c] = s[c];
+            }
+        }
+    }
+}
+
 int run_yolo_detect(std::forward_list<el_box_t> &out_boxes)
 {
     if (int_ptr == nullptr) {
@@ -529,10 +617,40 @@ int run_yolo_detect(std::forward_list<el_box_t> &out_boxes)
      * also MVE via -O2 auto-vectorization, stalled identically). */
     float w_scale = (float)(img_w - 1) / (MODEL_INPUT_W - 1);
     float h_scale = (float)(img_h - 1) / (MODEL_INPUT_H - 1);
-    hx_lib_image_resize_BGR8U3C_to_RGB24_helium((uint8_t*)raw_addr,
-            (uint8_t*)input->data.data,
-            (int)img_w, (int)img_h, MODEL_INPUT_C,
-            MODEL_INPUT_W, MODEL_INPUT_H, w_scale, h_scale);
+
+    /* AT+ROTATE: rotate the AI's input only, never the JPEG preview/sample
+     * stream (cam_handle_frame() reads jpeg_addr separately from raw_addr,
+     * untouched by this) - see sscma_cam_mic.h's app_set_ai_rotate()
+     * comment. rot==0 (the default) is the unmodified original path with
+     * zero extra cost; rot!=0 resizes into a scratch buffer first since
+     * rotate_rgb_90_steps() takes distinct in/out pointers (can't rotate
+     * input->data.data in place). Detected box coordinates are rotated back
+     * below, before being scaled to wire-space, so callers never see the
+     * rotation - it's purely an AI-input transform. */
+    uint8_t rot = app_get_ai_rotate();
+    if (rot == 0) {
+        hx_lib_image_resize_BGR8U3C_to_RGB24_helium((uint8_t*)raw_addr,
+                (uint8_t*)input->data.data,
+                (int)img_w, (int)img_h, MODEL_INPUT_C,
+                MODEL_INPUT_W, MODEL_INPUT_H, w_scale, h_scale);
+    } else {
+        /* .bss.NoInit (like tensor_arena_buf/demosbuf above/elsewhere) - a
+         * plain static here landed in the small 256KB CM55M_S_APP_DATA
+         * region instead of CM55M_S_SRAM and blew its heap/stack budget
+         * (confirmed at link time: __STACK_SIZE ASSERT failure, unrelated
+         * to CM55M_S_SRAM's own usage). */
+        __attribute__((section(".bss.NoInit")))
+        static uint8_t s_rotate_scratch[MODEL_INPUT_W * MODEL_INPUT_H * MODEL_INPUT_C] __ALIGNED(32);
+        hx_lib_image_resize_BGR8U3C_to_RGB24_helium((uint8_t*)raw_addr,
+                s_rotate_scratch,
+                (int)img_w, (int)img_h, MODEL_INPUT_C,
+                MODEL_INPUT_W, MODEL_INPUT_H, w_scale, h_scale);
+        /* rot: 1/2/3 -> 90/180/270 deg clockwise, matching
+         * unrotate_box_inplace()'s convention exactly (see
+         * rotate_rgb_90_steps()'s comment). */
+        rotate_rgb_90_steps(s_rotate_scratch, (uint8_t*)input->data.data,
+                MODEL_INPUT_W, MODEL_INPUT_C, rot);
+    }
 
     for (size_t i = 0; i < input->bytes; ++i) {
         *((int8_t *)input->data.data + i) = *((int8_t *)input->data.data + i) - 128;
@@ -547,6 +665,9 @@ int run_yolo_detect(std::forward_list<el_box_t> &out_boxes)
     float score_threshold = (float)app_get_tscore() / 100.0f;
     static yolo_box boxes[kMaxCandidates];  /* .bss, not stack/heap - see kMaxCandidates' comment */
     int n_boxes = decode_boxes(output, score_threshold, boxes);
+    for (int i = 0; i < n_boxes; ++i) {
+        unrotate_box_inplace(boxes[i], rot);
+    }
     int keep[MAX_YOLO_DETECTIONS];
     int n_keep = run_nms(boxes, n_boxes, keep);
 
@@ -628,18 +749,16 @@ void cam_handle_frame(void)
         return;
     }
 
-    /* 2026-07-12: skip the UART send entirely when nothing was detected,
-     * instead of always sending an INVOKE event (empty "boxes": [] or not).
-     * At tscore=25% most frames DO have a detection (~94% measured on the
-     * ESP32 bridge side), so this doesn't cut event volume much - but for
-     * the remaining empty frames it also skips the full JPEG payload in the
-     * non-result_only path, which is the expensive part on this UART link. */
-    if (boxes.empty()) {
-        return;
-    }
-
     std::string prefix_fields = concat_strings(", ", box_results_2_json_str(boxes));
 
+    /* 2026-07-19: previously also skipped the image on an empty detection
+     * (regardless of result_only) as a bandwidth optimization for the ESP32
+     * bridge's 10s idle-timeout heartbeat requirement - removed 2026-07-24
+     * along with the rest of the ESP32 bridge integration (that project was
+     * abandoned). Whether the image goes out is purely the caller's own
+     * result_only choice again (AT+INVOKE=<n,differed,result_only>), like it
+     * was before either ESP32-motivated tweak - a detection-count-dependent
+     * image gate was never something the caller asked for. */
     if (app_get_result_only()) {
         event_reply_named("INVOKE", prefix_fields);
     } else {

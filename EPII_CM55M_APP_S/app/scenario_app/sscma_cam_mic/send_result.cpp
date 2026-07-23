@@ -26,16 +26,15 @@ extern "C" {
  * sent).
  */
 
-/* 2026-07-11: was reopening the UART whenever the active transport id
- * changed (console_io.c's console_setup() pattern) - no longer needed now
- * that out_transport_init() opens UART0 (lookup only, board_init() already
- * opened it) and UART1 exactly once each, up front, before arming their DMA
- * RX chains. Reopening here again would risk cancelling an in-flight
- * uart_read_udma() on whichever UART just got reopened - see
- * out_transport.c's own comment on why RX moved to interrupt/DMA. Just a
- * lookup now; writes are the only thing this file still touches directly. */
+/* 2026-07-11: was reopening the UART on every call (console_io.c's
+ * console_setup() pattern) - no longer needed now that out_transport_init()
+ * opens UART0 (lookup only, board_init() already opened it) exactly once,
+ * up front, before arming its DMA RX chain. Reopening here again would risk
+ * cancelling an in-flight uart_read_udma() - see out_transport.c's own
+ * comment on why RX moved to interrupt/DMA. Just a lookup now; writes are
+ * the only thing this file still touches directly. */
 static DEV_UART* get_console_uart(void) {
-    return hx_drv_uart_get_dev((USE_DW_UART_E)out_transport_uart_id());
+    return hx_drv_uart_get_dev((USE_DW_UART_E)DW_UART_0_ID);
 }
 
 el_err_code_t send_bytes(const char* buffer, size_t size) {
@@ -760,7 +759,6 @@ void audio_tx_pump(void) {
     send_bytes(reinterpret_cast<const char*>(s_audio_tx_buf + s_audio_tx_pos), piece);
     s_audio_tx_pos += piece;
 }
-
 
 std::string model_info_2_json_str(el_model_info_t model_info) {
     return concat_strings("{\"id\": ",

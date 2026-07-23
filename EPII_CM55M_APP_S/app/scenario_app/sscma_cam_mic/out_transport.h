@@ -1,18 +1,18 @@
 /*
  * out_transport.h
  *
- * Picks which physical serial link carries the AT command channel and the
- * JSON/base64 result stream:
- *   - default: UART0, routed through the board's onboard USB-serial bridge
- *     (this is the port himax_vision.py / minicom normally talks to)
- *   - UART1, broken out on the Grove/pin header, once something is
- *     actually plugged in there
+ * The AT command channel and JSON/base64 result stream both go over UART0,
+ * routed through the board's onboard USB-serial bridge (this is the port
+ * himax_vision.py / minicom / a direct USB serial connection normally talks
+ * to).
  *
- * Detection is an active echo probe (per user direction, not passive
- * listening): while still on the default transport, periodically write a
- * single marker byte out UART1 and see whether it comes back within a
- * short window (a wired loopback / echoing peer on the other end). On a
- * match we switch permanently to UART1 for the rest of the session.
+ * 2026-07-24: this used to also support switching to UART1 (Grove/pin-header
+ * link) for an ESP32C3 bridge board wired there via an active echo-probe
+ * handshake - removed along with i2c_cmd.c's I2C command-ingress path once
+ * that ESP32C3 bridge project was abandoned in favor of talking to WE2
+ * directly over its own USB. UART0's interrupt/DMA-fed RX (below) stays -
+ * that solves a real hardware FIFO-overflow problem unrelated to which
+ * transport is active.
  */
 
 #ifndef APP_SCENARIO_SSCMA_CAM_MIC_OUT_TRANSPORT_H_
@@ -25,39 +25,34 @@
 extern "C" {
 #endif
 
-typedef enum {
-    OUT_TRANSPORT_USB   = 0, /* UART0 via the onboard USB-serial bridge (default) */
-    OUT_TRANSPORT_UART1 = 1, /* UART1, external Grove/pin-header link */
-} out_transport_e;
-
-/* Opens UART1 (UART0 is already opened by board_init()/console_setup()). */
+/* UART0 is already opened by board_init()/console_setup(); this just looks
+ * up the handle and arms its interrupt/DMA RX chain. */
 void out_transport_init(void);
 
-/* Drives the echo-probe state machine. Call from the idle loop. A no-op
- * once already switched to UART1. */
-void out_transport_poll(void);
-
-out_transport_e out_transport_get(void);
-
-/* USE_DW_UART_E id of whichever transport is currently active; use this
- * instead of a hardcoded CONSOLE_UART_ID when opening/reading/writing the
- * console UART. */
-int out_transport_uart_id(void);
-
-/* 2026-07-11: pops one byte (if available) from the interrupt/DMA-fed ring
- * buffer for whichever UART out_transport_uart_id() currently reports -
- * read_bytes_nonblock() (send_result.cpp) uses this instead of touching the
- * DW_UART driver directly, so incoming bytes get picked up the instant they
- * land rather than whenever a task next happens to poll (see out_transport.c's
- * own comment for why that distinction matters: the RX hardware FIFO is only
- * 16 bytes, and overflows well before any task polling interval could
- * reliably catch it). Returns false if nothing is buffered. */
+/* 2026-07-11: interrupt/DMA-driven RX, replacing a plain poll of
+ * uart_read_nonblock(). WE2's DW_UART RX is a bare 16-byte hardware FIFO -
+ * at 921600 baud that fills in ~173us, faster than any FreeRTOS task
+ * polling loop (1ms tick granularity) can reliably drain, so bursts longer
+ * than 16 bytes would routinely arrive truncated. uart_read_udma() is armed
+ * for exactly 1 byte at a time; its completion ISR fires (and immediately
+ * re-arms the next 1-byte read) the instant each byte lands, feeding a
+ * lock-free single-producer(ISR)/single-consumer(task) ring buffer this
+ * pops from - read_bytes_nonblock() (send_result.cpp) uses this instead of
+ * touching the DW_UART driver directly. Returns false if nothing is
+ * buffered. */
 bool out_transport_rx_pop(uint8_t *out_byte);
 
-/* cam_task and audio_task both end up touching whichever UART peripheral is
- * currently active (send_bytes()/read_bytes*() from send_result.cpp, and the
- * UART1 echo probe here) with no locking in the underlying driver. Every
- * caller must wrap its driver access in this lock/unlock pair. */
+/* cam_task and audio_task both touch the UART0 peripheral (send_bytes() from
+ * send_result.cpp) with no locking in the underlying driver. Every caller
+ * must wrap its driver access in this lock/unlock pair.
+ *
+ * Recursive: callers that stream a large reply in bounded chunks (to avoid
+ * one big heap allocation - see event_reply_named_with_payload() in
+ * send_result.cpp) hold the lock across the whole multi-chunk send so the
+ * other task can't interleave its own message in the middle, while each
+ * individual send_bytes() call underneath still takes the same lock itself.
+ * A plain (non-recursive) mutex would deadlock the owning task on the
+ * second, nested take. */
 void out_transport_lock(void);
 void out_transport_unlock(void);
 
